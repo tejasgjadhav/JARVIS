@@ -126,6 +126,22 @@ def transcribe():
 
 # ─── Equity Report — real data, no LLM ─────────────────────
 _report_cache = {}
+_CACHE_TTL = 600   # seconds — reports go stale fast when the price moves
+
+def _cache_put(sym, r):
+    import time as _t
+    _report_cache[sym] = (r, _t.time())
+
+def _cache_get(sym):
+    import time as _t
+    hit = _report_cache.get(sym)
+    if not hit:
+        return None
+    r, ts = hit
+    if _t.time() - ts > _CACHE_TTL:
+        del _report_cache[sym]
+        return None
+    return r
 
 def _detect_horizon(message):
     """Short-term (6-12mo technical) vs long-term (DCF)."""
@@ -226,7 +242,7 @@ def analyze_chat():
     horizon = _detect_horizon(message)
     narrative = _claude_narrative(d, a, horizon)
     r = R.assemble(d, a, narrative, horizon=horizon)
-    _report_cache[r['symbol']] = r
+    _cache_put(r['symbol'], r)
     val = r.get('validation') or {}
     return jsonify({
         'is_analysis': True,
@@ -256,7 +272,7 @@ def stock_report():
         return jsonify({'error': str(ex)}), 502
     narrative = _claude_narrative(d, a)          # hybrid: Claude authors, real data grounds
     r = R.assemble(d, a, narrative)
-    _report_cache[r['symbol']] = r
+    _cache_put(r['symbol'], r)
     val = r.get('validation') or {}
     return jsonify({
         'symbol': r['symbol'], 'name': r['name'], 'summary': r['summary'],
@@ -274,11 +290,11 @@ def stock_report():
 @app.route('/api/stock/download/<fmt>/<path:symbol>')
 def stock_download(fmt, symbol):
     from report_engine import generate_report
-    r = _report_cache.get(symbol)
+    r = _cache_get(symbol)
     if not r:
         try:
             r = generate_report(symbol)
-            _report_cache[symbol] = r
+            _cache_put(symbol, r)
         except Exception as ex:
             return jsonify({'error': str(ex)}), 502
     safe = symbol.replace('.', '_')

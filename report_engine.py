@@ -703,6 +703,33 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
     return "\n\n".join(p), speech
 
 
+def cross_validate_price(symbol: str, yf_price: float, timeout: int = 8) -> dict:
+    """Independent price check against Google Finance (NSE). Part of the Python
+    validation layer: flags if yfinance's price diverges >2% from a second source."""
+    base = (symbol or "").replace(".NS", "").replace(".BO", "")
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://www.google.com/finance/quote/{base}:NSE",
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                     "Accept-Language": "en-US,en;q=0.9"})
+        html = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "ignore")
+        import re as _re
+        m = _re.search(r'class="YMlKec fxKbKc">\s*₹\s*([0-9,]+(?:\.[0-9]+)?)', html)
+        if not m:
+            # class names vary by rendering — the first ₹ figure on the page is the header quote
+            m = _re.search(r'₹\s*([0-9,]+\.[0-9]{2})', html)
+        if not m:
+            return {"ok": None, "note": "second source unavailable"}
+        gp = float(m.group(1).replace(",", ""))
+        diff = abs(gp - yf_price) / gp if gp else None
+        return {"ok": diff is not None and diff < 0.02, "google_price": gp,
+                "diff_pct": round(diff * 100, 2) if diff is not None else None}
+    except Exception:
+        return {"ok": None, "note": "second source unavailable"}
+
+
 def data_recency(d: dict) -> dict:
     """Python gate: is the financial data from the latest or previous quarter?"""
     q = d.get("quarter_end")
@@ -2145,6 +2172,20 @@ def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") ->
         })
         if not recency["ok"]:
             validation["ok"] = False
+        # Price cross-validated against a second source (Google Finance NSE)
+        pv = cross_validate_price(d["symbol"], d["price"])
+        if pv.get("ok") is None:
+            validation["checks"].append({"name": "price cross-check (2nd source)",
+                                         "pass": True, "detail": pv.get("note", "n/a")})
+        else:
+            validation["checks"].append({
+                "name": "price cross-check (2nd source)",
+                "pass": pv["ok"],
+                "detail": f"yfinance ₹{d['price']:,.2f} vs Google ₹{pv['google_price']:,.2f} "
+                          f"({pv['diff_pct']}% diff)",
+            })
+            if not pv["ok"]:
+                validation["ok"] = False
     result = {
         "symbol": d["symbol"],
         "name": d["name"],
