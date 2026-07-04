@@ -15,6 +15,7 @@ import yfinance as yf
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, Reference, Series
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -23,6 +24,41 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
 )
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# ── Unicode PDF fonts (so ₹, →, ≈ etc. render, not as black boxes) ──
+PDF_FONT, PDF_BOLD = "Helvetica", "Helvetica-Bold"
+
+def _register_pdf_fonts():
+    global PDF_FONT, PDF_BOLD
+    import os
+    tries = []
+    try:
+        import matplotlib
+        base = os.path.join(os.path.dirname(matplotlib.__file__), "mpl-data/fonts/ttf")
+        tries.append((os.path.join(base, "DejaVuSans.ttf"), os.path.join(base, "DejaVuSans-Bold.ttf"), None))
+    except Exception:
+        pass
+    tries.append(("/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/Helvetica.ttc", (0, 1)))
+    for reg, bold, idx in tries:
+        try:
+            if not os.path.exists(reg):
+                continue
+            if idx:
+                pdfmetrics.registerFont(TTFont("UFont", reg, subfontIndex=idx[0]))
+                pdfmetrics.registerFont(TTFont("UFont-Bold", bold, subfontIndex=idx[1]))
+            else:
+                pdfmetrics.registerFont(TTFont("UFont", reg))
+                pdfmetrics.registerFont(TTFont("UFont-Bold", bold if os.path.exists(bold) else reg))
+            pdfmetrics.registerFontFamily("UFont", normal="UFont", bold="UFont-Bold",
+                                          italic="UFont", boldItalic="UFont-Bold")
+            PDF_FONT, PDF_BOLD = "UFont", "UFont-Bold"
+            return
+        except Exception:
+            continue
+
+_register_pdf_fonts()
 
 # ── Palette (JARVIS arc-reactor blue) ──────────────────────
 NAVY = "0B1F3A"
@@ -40,6 +76,27 @@ def normalize_symbol(sym: str) -> str:
     if "." not in s and s not in ("", ):
         s = s + ".NS"
     return s
+
+
+# Known renames / demergers where searching the OLD name/ticker fails.
+SYMBOL_ALIASES = {
+    "ZOMATO": "ETERNAL",       # Zomato → Eternal Ltd (2025)
+    "TATAMTRDVR": "TMCV",      # Tata Motors DVR
+}
+
+def apply_alias(sym: str):
+    if not sym:
+        return sym
+    base = sym.upper().replace(".NS", "").replace(".BO", "")
+    return SYMBOL_ALIASES.get(base, sym)
+
+
+def fy_labels(d, n=5):
+    """Projected fiscal-year labels, e.g. FY27E … FY31E (Indian FY ends March)."""
+    b = (d or {}).get("fy_base")
+    if not b:
+        return [f"Year {i + 1}" for i in range(n)]
+    return [f"FY{str(b + i + 1)[-2:]}E" for i in range(n)]
 
 
 def resolve_symbol(query: str):
@@ -100,10 +157,28 @@ def fetch_stock(symbol: str) -> dict:
                     fcf_stmt = ocf + (capex or 0)  # capex is negative in the statement
     except Exception:
         pass
+    rev_cagr = None
+    rev_hist = None
+    ebit_hist = None
+    fy_base = None
     try:
         fin = t.financials
         if fin is not None and not fin.empty and "Total Revenue" in fin.index:
             rev_stmt = _num(fin.loc["Total Revenue"].iloc[0])
+            rr = fin.loc["Total Revenue"].dropna()
+            if len(rr) >= 2:
+                newest, oldest, yrs = _num(rr.iloc[0]), _num(rr.iloc[-1]), len(rr) - 1
+                if newest and oldest and oldest > 0:
+                    rev_cagr = (newest / oldest) ** (1 / yrs) - 1
+                rev_hist = [_num(x) for x in rr.tolist()]      # newest → oldest
+                try:
+                    fy_base = int(rr.index[0].year)             # latest reported FY-end year
+                except Exception:
+                    pass
+            for ek in ("Operating Income", "EBIT", "Operating Revenue"):
+                if ek in fin.index:
+                    ebit_hist = [_num(x) for x in fin.loc[ek].dropna().tolist()]
+                    break
     except Exception:
         pass
 
@@ -159,6 +234,55 @@ def fetch_stock(symbol: str) -> dict:
     if dma200 is None and hist is not None and len(hist) >= 100:
         dma200 = _num(hist["Close"].tail(200).mean())
 
+    # ── Technicals (for short-term analysis) ──
+    tech = {}
+    if hist is not None and len(hist) > 30:
+        close = hist["Close"]
+        tech["ma20"] = _num(close.tail(20).mean())
+        tech["ma50"] = _num(close.tail(50).mean())
+        tech["ma200"] = _num(close.tail(200).mean()) if len(close) >= 200 else dma200
+        # RSI(14)
+        delta = close.diff()
+        up = _num(delta.clip(lower=0).tail(14).mean()) or 0
+        down = _num((-delta.clip(upper=0)).tail(14).mean()) or 0
+        tech["rsi"] = 100.0 if down == 0 else 100 - 100 / (1 + up / down)
+        # momentum returns
+        def _ret(n):
+            return _num(close.iloc[-1] / close.iloc[-n - 1] - 1) if len(close) > n else None
+        tech["ret_1m"], tech["ret_3m"], tech["ret_6m"] = _ret(21), _ret(63), _ret(126)
+        # annualised volatility (6m)
+        tech["vol"] = _num(close.pct_change().tail(126).std() * (252 ** 0.5))
+        # support / resistance (3-month)
+        tech["support"] = _num(close.tail(63).min())
+        tech["resistance"] = _num(close.tail(63).max())
+
+    # ── Analyst ratings distribution + named broker actions ──
+    rating_dist = None
+    try:
+        rec = t.recommendations
+        if rec is not None and len(rec):
+            row0 = rec.iloc[0]
+            rating_dist = {k: int(row0.get(c, 0)) for k, c in
+                           (("strong_buy", "strongBuy"), ("buy", "buy"), ("hold", "hold"),
+                            ("sell", "sell"), ("strong_sell", "strongSell"))}
+    except Exception:
+        pass
+    brokers = []
+    try:
+        ud = t.upgrades_downgrades
+        if (ud is None or len(ud) == 0) and sym.endswith(".NS"):
+            ud = yf.Ticker(sym[:-3]).upgrades_downgrades   # dual-listed ADR (named firms)
+        if ud is not None and len(ud):
+            for gdate, urow in ud.sort_index(ascending=False).head(15).iterrows():
+                firm = str(urow.get("Firm", "")).strip()
+                grade = str(urow.get("ToGrade", "")).strip()
+                if firm:
+                    brokers.append({"firm": firm, "grade": grade,
+                                    "action": str(urow.get("Action", "")).strip(),
+                                    "date": str(gdate)[:10]})
+    except Exception:
+        pass
+
     return {
         "symbol": sym,
         "name": info.get("longName") or info.get("shortName") or sym,
@@ -192,7 +316,16 @@ def fetch_stock(symbol: str) -> dict:
         "revenue": _fx(rev_stmt or _num(info.get("totalRevenue"))),
         "fin_ccy": fin_ccy, "fx": fx,
         "quarter_end": q_end, "data_ref_date": ref_date,
+        "tech": tech, "rating_dist": rating_dist, "brokers": brokers,
+        "rev_cagr": rev_cagr,
+        "rev_hist_cr": [_fx(x) / 1e7 for x in rev_hist] if rev_hist else None,
+        "fy_base": fy_base,
         "target_mean": _num(info.get("targetMeanPrice")),
+        "target_high": _num(info.get("targetHighPrice")),
+        "target_low": _num(info.get("targetLowPrice")),
+        "rec_key": info.get("recommendationKey"),
+        "rec_mean": _num(info.get("recommendationMean")),
+        "num_analysts": _num(info.get("numberOfAnalystOpinions")),
     }
 
 
@@ -367,6 +500,20 @@ def numbers_block(d: dict, a: dict, result: dict) -> str:
     return "\n".join(lines)
 
 
+def consensus_summary(d: dict):
+    """Street analyst consensus from live data (or None if unavailable/unreliable)."""
+    tm, price = d.get("target_mean"), d.get("price")
+    if not tm or not price or not (0.3 * price <= tm <= 3 * price):
+        return None
+    return {
+        "mean": tm, "high": d.get("target_high"), "low": d.get("target_low"),
+        "rec": (d.get("rec_key") or "").upper().replace("_", " ") or None,
+        "rec_mean": d.get("rec_mean"),
+        "n": int(d["num_analysts"]) if d.get("num_analysts") else None,
+        "upside_pct": (tm / price - 1) * 100,
+    }
+
+
 def compose_analysis(d: dict, a: dict, narrative, result: dict):
     """Return (chat_markdown, speech). chat_markdown = the ENTIRE Claude analysis
     for display; speech = first 2 lines + last 2 lines for JARVIS to read aloud."""
@@ -381,14 +528,36 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
     rec_last = rec.split(". ")[-1].strip().rstrip(".") + "."
     rationale = (n.get("verdict_rationale") or "").strip()
 
-    # ── Spoken: first 2 lines (intro + thesis) + last 2 lines (rationale + call) ──
+    # ── Spoken: 2 lines about the company (intro + thesis) + final recommendation ──
     intro_line = f"{d['name']}, {sector}." if sector else f"{d['name']}."
     final_line = f"Final recommendation: {verdict}" + (f", {rationale}" if rationale else "") + \
                  (f". Twelve-month target {tgt:,.0f} rupees." if tgt else ".")
-    speech = " ".join([intro_line, thesis_first, rec_last, final_line])
+    speech = " ".join([intro_line, thesis_first, final_line])
 
-    # ── Chat: the entire analysis ──
-    p = [f"**{d['name']} ({d['symbol']})** · ₹{d['price']:,.0f} · **{verdict}**", ""]
+    price = d["price"]
+    pct = lambda x: f"{x*100:.1f}%" if x is not None else "—"
+
+    # ── Chat: metrics → analysis → ALL calcs (refer Excel) → recommendation LAST ──
+    p = [f"**{d['name']} ({d['symbol']})** · ₹{price:,.0f}"]
+
+    # key metrics
+    kv = []
+    pe = d.get("pe")
+    if pe:
+        kv.append(f"P/E {pe:.0f}x" + (" (rich)" if pe > 60 else ""))
+    if d.get("roe") is not None:
+        kv.append(f"ROE {d['roe']*100:.1f}%")
+    rg = d.get("rev_growth")
+    if rg is not None:
+        kv.append("Rev gr n/m" if abs(rg) > 1.0 else f"Rev gr {rg*100:.1f}%")
+    if d.get("debt_to_equity") is not None:
+        de = d["debt_to_equity"]
+        kv.append(f"D/E {(de/100 if de > 5 else de):.2f}")
+    fcf_str = "negative (growth-stage)" if (d.get("fcf") is not None and d["fcf"] < 0) else _fmt_money(d.get("fcf"))
+    p.append((" · ".join(kv) + "\n" if kv else "") +
+             f"Revenue {_fmt_money(d.get('revenue'))} · FCF {fcf_str} · Data as-of {result.get('data_asof')}")
+
+    # analysis
     p.append(f"**Thesis.** {thesis}")
     if n.get("business"):
         p.append(f"**Business & moat.** {n['business']}")
@@ -400,44 +569,137 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
         p.append("**Catalysts:**\n" + "\n".join(f"- {x}" for x in n["catalysts"]))
     if n.get("risks"):
         p.append("**Key risks:**\n" + "\n".join(f"- {x}" for x in n["risks"]))
-    p.append(f"**Recommendation.** {rec}")
 
-    # ── VALUATION & ASSUMPTIONS (institutional detail) ──
+    # ── FULL DCF CALCULATIONS (all line items, year by year) ──
     asmp = result.get("assumptions") or {}
+    dcf = None
     if asmp:
         dcf = python_dcf(asmp)
         wb = n.get("wacc_build") or {}
-        pct = lambda x: f"{x*100:.1f}%" if x is not None else "—"
-        vlines = ["**Valuation — DCF assumptions**"]
+        v = ["**Valuation — full DCF model (₹ Crore)**"]
         if wb:
-            ke = wb.get("cost_of_equity")
-            vlines.append(
-                f"WACC build: RF {pct(wb.get('rf'))} + β{wb.get('beta','—')}×ERP {pct(wb.get('erp'))} "
-                f"→ Ke {pct(ke)}; Kd {pct(wb.get('cost_of_debt'))}; "
-                f"{pct(wb.get('equity_weight'))} equity / {pct(wb.get('debt_weight'))} debt "
-                f"→ **WACC {pct(asmp.get('wacc'))}**")
+            v.append(f"WACC build: RF {pct(wb.get('rf'))} + β{wb.get('beta','—')}×ERP {pct(wb.get('erp'))} "
+                     f"→ Ke {pct(wb.get('cost_of_equity'))}; Kd {pct(wb.get('cost_of_debt'))}; "
+                     f"{pct(wb.get('equity_weight'))} equity / {pct(wb.get('debt_weight'))} debt "
+                     f"→ **WACC {pct(asmp.get('wacc'))}**")
         else:
-            vlines.append(f"Discount rate (WACC): **{pct(asmp.get('wacc'))}**")
+            v.append(f"Discount rate (WACC): **{pct(asmp.get('wacc'))}**")
         g = asmp.get("growth", [])
-        vlines.append(
-            f"Drivers: revenue growth {pct(g[0]) if g else '—'}→{pct(g[-1]) if g else '—'} (5y) · "
-            f"EBIT margin {pct(asmp.get('ebit_margin'))} · tax {pct(asmp.get('tax_rate'))} · "
-            f"capex {pct(asmp.get('capex_pct'))} · D&A {pct(asmp.get('da_pct'))} · "
-            f"ΔNWC {pct(asmp.get('nwc_pct'))} · terminal {pct(asmp.get('terminal_growth'))}")
+        em = asmp.get("ebit_margin")
+        em = em if isinstance(em, list) else [em] * 5
+        v.append(f"Assumptions: growth {' / '.join(pct(x) for x in g)}")
+        v.append(f"EBIT margin path: {' / '.join(pct(x) for x in em)}")
+        v.append(f"tax {pct(asmp.get('tax_rate'))} · capex {pct(asmp.get('capex_pct'))} · D&A {pct(asmp.get('da_pct'))} · "
+                 f"ΔNWC {pct(asmp.get('nwc_pct'))} · terminal {pct(asmp.get('terminal_growth'))}")
         sch = dcf.get("schedule", [])
         if sch:
-            vlines.append("FCF (₹Cr): " + " · ".join(f"Y{s['year']} {s['fcf']:,.0f}" for s in sch))
-        vlines.append(
-            f"PV explicit ₹{dcf['pv_explicit']:,.0f} Cr + PV terminal ₹{dcf['pv_terminal']:,.0f} Cr "
-            f"= EV ₹{dcf['ev']:,.0f} Cr − net debt ₹{asmp.get('net_debt_cr',0):,.0f} Cr "
-            f"= Equity ₹{dcf['equity']:,.0f} Cr" +
-            (f" → **DCF fair value ₹{dcf['fair_value']:,.0f}/sh**" if dcf.get('fair_value') else ""))
+            fyl = fy_labels(d, len(sch))
+            v.append("**Revenue projection** (₹Cr): " + " · ".join(f"{fyl[i]} {s['revenue']:,.0f}" for i, s in enumerate(sch)))
+            v.append("**FCF projection** (₹Cr): " + " · ".join(f"{fyl[i]} {s['fcf']:,.0f}" for i, s in enumerate(sch)))
+            def rowfmt(label, key):
+                return label.ljust(12) + "".join(f"{s[key]:>11,.0f}" for s in sch)
+            tbl = ["Line item".ljust(12) + "".join(f"{fyl[i]:>11}" for i in range(len(sch))),
+                   rowfmt("Revenue", "revenue"),
+                   rowfmt("EBIT", "ebit"),
+                   rowfmt("NOPAT", "nopat"),
+                   rowfmt("(+) D&A", "da"),
+                   rowfmt("(-) Capex", "capex"),
+                   rowfmt("(-) d NWC", "dnwc"),
+                   rowfmt("FCF", "fcf"),
+                   "Disc factor".ljust(12) + "".join(f"{s['df']:>11.3f}" for s in sch),
+                   rowfmt("PV of FCF", "pv_fcf")]
+            v.append("```\n" + "\n".join(tbl) + "\n```")
+        v.append(f"Σ PV explicit ₹{dcf['pv_explicit']:,.0f} + PV terminal ₹{dcf['pv_terminal']:,.0f} "
+                 f"= EV ₹{dcf['ev']:,.0f} − net debt ₹{asmp.get('net_debt_cr',0):,.0f} "
+                 f"= Equity ₹{dcf['equity']:,.0f} Cr" +
+                 (f" → **DCF fair value ₹{dcf['fair_value']:,.0f}/sh**" if dcf.get("fair_value") else ""))
         if n.get("assumption_log"):
-            vlines.append("Assumption log:\n" + "\n".join(f"- {x}" for x in n["assumption_log"]))
-        p.append("\n".join(vlines))
+            v.append("Assumption log:\n" + "\n".join(f"- {x}" for x in n["assumption_log"]))
+        v.append("_📊 Full linked model with live formulas is in the downloaded Excel "
+                 "(sheets: Assumptions · Model · Scorecard · DCF)._")
+        p.append("\n".join(v))
 
-    p.append("")
-    p.append(result["numbers"])
+    # ── SCENARIOS (bull / base / bear) ──
+    scen = n.get("scenarios")
+    if scen:
+        sl = ["**Scenarios (bull / base / bear)**"]
+        ev = 0.0
+        for key in ("bull", "base", "bear"):
+            s = scen.get(key) or {}
+            tg = s.get("target"); pr = s.get("probability")
+            if tg:
+                sl.append(f"{key.capitalize()}: ₹{tg:,.0f} ({(tg/price-1)*100:+.0f}%)" +
+                          (f" · {pr*100:.0f}%" if pr is not None else "") +
+                          (f" — {s['driver']}" if s.get("driver") else ""))
+                if pr: ev += tg * pr
+        if ev:
+            sl.append(f"**Probability-weighted target: ₹{ev:,.0f} ({(ev/price-1)*100:+.0f}%)**")
+        p.append("\n".join(sl))
+
+    # ── VALUATION TRIANGULATION (comps · SOTP · football field) ──
+    comps = n.get("comps")
+    sotp = n.get("sotp")
+    dcf_fv = (result.get("validation") or {}).get("computed_fair_value")
+    if comps or sotp:
+        ml = ["**Valuation triangulation**"]
+        if dcf_fv:
+            ml.append(f"DCF ₹{dcf_fv:,.0f}")
+        if comps and comps.get("implied_value_per_share"):
+            peers = ", ".join(pp.get("name", "") for pp in (comps.get("peers") or [])[:5])
+            ml.append(f"Comps ₹{comps['implied_value_per_share']:,.0f} (median {comps.get('median_ev_ebitda','?')}x EV/EBITDA vs {peers})")
+        if sotp and sotp.get("implied_value_per_share"):
+            segs = " + ".join(s.get("segment", "") for s in (sotp.get("segments") or []))
+            ml.append(f"SOTP ₹{sotp['implied_value_per_share']:,.0f} ({segs})")
+        _c = consensus_summary(d)
+        if _c and _c.get("low") and _c.get("high"):
+            ml.append(f"Analyst range ₹{_c['low']:,.0f}–₹{_c['high']:,.0f}")
+        ml.append("_📊 Football-field chart + Comps/SOTP sheets in the Excel._")
+        p.append("\n".join(ml))
+
+    # ── STREET CONSENSUS vs OUR VIEW ──
+    cons = consensus_summary(d)
+    if cons:
+        rng = ""
+        if cons.get("low") and cons.get("high"):
+            rng = f" (range ₹{cons['low']:,.0f}–₹{cons['high']:,.0f})"
+        cl = ["**Street consensus vs our view**"]
+        cl.append(f"Street: **{cons['rec'] or 'N/A'}** · mean target ₹{cons['mean']:,.0f} "
+                  f"({cons['upside_pct']:+.0f}%){rng}" +
+                  (f" · {cons['n']} analysts" if cons.get("n") else ""))
+        rd = d.get("rating_dist")
+        if rd:
+            cl.append(f"Ratings: {rd.get('strong_buy',0)} strong-buy · {rd.get('buy',0)} buy · "
+                      f"{rd.get('hold',0)} hold · {rd.get('sell',0)} sell · {rd.get('strong_sell',0)} strong-sell")
+        brk = d.get("brokers") or []
+        if brk:
+            names = " · ".join(f"{b['firm']} ({b['grade']})" for b in brk[:6] if b.get("grade"))
+            if names:
+                cl.append(f"Recent broker actions: {names}")
+        ours_t = tgt or (result.get("validation") or {}).get("computed_fair_value")
+        if ours_t:
+            gap = (ours_t / cons["mean"] - 1) * 100
+            cl.append(f"Ours: **{verdict}** · target ₹{ours_t:,.0f} — **{gap:+.0f}% vs street**")
+        if n.get("vs_consensus"):
+            cl.append(n["vs_consensus"])
+        if n.get("divergence_factor"):
+            cl.append(f"**Key fundamental difference:** {n['divergence_factor']}")
+        p.append("\n".join(cl))
+
+    # ── RECOMMENDATION — LAST, after analysing ──
+    rblock = [f"**Recommendation: {verdict}**", rec]
+    fvc = (result.get("validation") or {}).get("computed_fair_value")
+    dcf_reliable = fvc and d.get("fcf") and d["fcf"] > 0 and 0.5 * price <= fvc <= 2.0 * price
+    tail = []
+    if tgt:
+        tail.append(f"Analyst target ₹{tgt:,.0f} ({(tgt/price-1)*100:+.0f}%)")
+    if dcf_reliable:
+        tail.append(f"DCF fair value ₹{fvc:,.0f} ({(fvc/price-1)*100:+.0f}%)")
+    if tail:
+        rblock.append(" · ".join(tail))
+    validated = (result.get("validation") or {}).get("ok")
+    rblock.append(f"_{'✅ calcs validated by Python layer' if validated else '⚠ validation flagged'} · Excel + PDF downloading…_")
+    p.append("\n".join(rblock))
+
     return "\n\n".join(p), speech
 
 
@@ -504,7 +766,9 @@ def default_assumptions(d: dict) -> dict:
     g5 = max(g1 * 0.55, 0.06)
     growth = [round(g1 + (g5 - g1) * i / 4, 4) for i in range(5)]  # linear fade
     margin = d.get("margin")
-    ebit_margin = round(min(max((margin * 1.25) if margin is not None else 0.15, 0.05), 0.45), 4)
+    m0 = round(min(max((margin * 1.25) if margin is not None else 0.15, 0.05), 0.45), 4)
+    # gentle expansion path from trailing margin (fallback; Claude usually supplies its own)
+    ebit_margin = [round(min(m0 + 0.004 * i, 0.55), 4) for i in range(5)]
     net_debt_cr = ((d.get("total_debt") or 0) - (d.get("total_cash") or 0)) / 1e7
     shares_cr = (d.get("shares") or 0) / 1e7
     return {
@@ -538,7 +802,15 @@ def merge_assumptions(base: dict, claude: dict) -> dict:
         g = [x for x in g if x is not None]
         if len(g) == 5:
             out["growth"] = g
-    for key, lo, hi in [("ebit_margin", 0.02, 0.55), ("tax_rate", 0.10, 0.40),
+    # EBIT margin is a 5-year path (accept a scalar for backward compat)
+    cm = claude.get("ebit_margin")
+    if cm is not None:
+        cm_list = cm if isinstance(cm, list) else [cm] * 5
+        mm = [clamp(x, 0.02, 0.55) for x in cm_list[:5]]
+        mm = [x for x in mm if x is not None]
+        if len(mm) == 5:
+            out["ebit_margin"] = [round(x, 4) for x in mm]
+    for key, lo, hi in [("tax_rate", 0.10, 0.40),
                         ("capex_pct", 0.0, 0.25), ("da_pct", 0.0, 0.20),
                         ("nwc_pct", -0.10, 0.20), ("wacc", 0.07, 0.20),
                         ("terminal_growth", 0.0, 0.07)]:
@@ -557,11 +829,14 @@ def python_dcf(asmp: dict) -> dict:
     Mirrors the MODEL sheet formulas cell-for-cell."""
     rev_prev = asmp["base_rev_cr"]
     wacc, tg = asmp["wacc"], asmp["terminal_growth"]
+    margins = asmp["ebit_margin"]
+    if not isinstance(margins, list):
+        margins = [margins] * 5
     pv_sum, fcf_last, df_last = 0.0, 0.0, 1.0
     schedule = []
     for i in range(5):
         rev = rev_prev * (1 + asmp["growth"][i])
-        ebit = rev * asmp["ebit_margin"]
+        ebit = rev * margins[i]
         nopat = ebit * (1 - asmp["tax_rate"])
         da = rev * asmp["da_pct"]
         capex = rev * asmp["capex_pct"]
@@ -569,7 +844,9 @@ def python_dcf(asmp: dict) -> dict:
         fcf = nopat + da - capex - dnwc
         df = 1 / (1 + wacc) ** (i + 1)
         pv_sum += fcf * df
-        schedule.append({"year": i + 1, "revenue": rev, "ebit": ebit, "fcf": fcf, "pv_fcf": fcf * df})
+        schedule.append({"year": i + 1, "revenue": rev, "ebit": ebit, "nopat": nopat,
+                         "da": da, "capex": capex, "dnwc": dnwc, "fcf": fcf,
+                         "df": df, "pv_fcf": fcf * df})
         rev_prev, fcf_last, df_last = rev, fcf, df
     tv = fcf_last * (1 + tg) / (wacc - tg)
     pv_tv = tv * df_last
@@ -689,9 +966,11 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
     wa["A1"] = "ASSUMPTIONS  (editable drivers)"
     wa["A1"].fill = hdr_fill
     wa["A1"].font = hdr_font
+    _m_list = asmp["ebit_margin"] if isinstance(asmp["ebit_margin"], list) else [asmp["ebit_margin"]] * 5
+    _m_avg = round(sum(_m_list) / len(_m_list), 4)
     inputs = [
         ("Base revenue (₹ Cr)", asmp["base_rev_cr"], num),      # B3
-        ("EBIT margin", asmp["ebit_margin"], pct),               # B4
+        ("EBIT margin (avg)", _m_avg, pct),                      # B4 (per-year path in row 17)
         ("Tax rate", asmp["tax_rate"], pct),                     # B5
         ("Capex (% revenue)", asmp["capex_pct"], pct),           # B6
         ("D&A (% revenue)", asmp["da_pct"], pct),                # B7
@@ -702,6 +981,27 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
         ("Shares (Cr)", asmp["shares_cr"], "#,##0.00"),          # B12
         ("Current price (₹)", asmp["price"], "#,##0.00"),        # B13
     ]
+    # header row + per-assumption SOURCE / BASIS column (col C)
+    for ci, htxt in ((1, "Driver"), (2, "Value"), (3, "Source / Basis")):
+        hc = wa.cell(2, ci, htxt)
+        hc.font = Font(bold=True, color="FFFFFF")
+        hc.fill = PatternFill("solid", fgColor=NAVY)
+    src = (narrative or {}).get("sources") or {}
+    wb_note = ((narrative or {}).get("wacc_build") or {}).get("note")
+    data_src = f"Yahoo Finance · FY as-of {d.get('quarter_end') or 'latest'}"
+    source_map = {
+        "Base revenue (₹ Cr)": data_src,
+        "EBIT margin (avg)": src.get("ebit_margin", "trailing margin + op leverage"),
+        "Tax rate": src.get("tax_rate", "India statutory ~25%"),
+        "Capex (% revenue)": src.get("capex_pct", "historical capex/revenue"),
+        "D&A (% revenue)": src.get("da_pct", "historical D&A/revenue"),
+        "Δ NWC (% Δrevenue)": src.get("nwc_pct", "working-capital trend"),
+        "WACC (discount rate)": src.get("wacc", wb_note or "CAPM: RF + β×ERP"),
+        "Terminal growth": src.get("terminal_growth", "long-run nominal GDP"),
+        "Net debt (₹ Cr)": data_src,
+        "Shares (Cr)": data_src,
+        "Current price (₹)": "Yahoo Finance (live)",
+    }
     r = 3
     for label, val, fmt in inputs:
         wa.cell(r, 1, label).font = Font(bold=True, color=NAVY)
@@ -709,16 +1009,38 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
         c.number_format = fmt
         c.fill = PatternFill("solid", fgColor="FFF7E0")  # highlight = editable input
         c.border = border
+        sc = wa.cell(r, 3, source_map.get(label, "—"))
+        sc.font = Font(italic=True, color=GREY, size=9)
+        sc.alignment = Alignment(wrap_text=True, vertical="top")
+        sc.border = border
         r += 1
     # revenue growth path across Year 1..5 → B15:F15
-    wa.cell(15, 1, "Revenue growth (Yr1→Yr5)").font = Font(bold=True, color=NAVY)
+    _fyl = fy_labels(d)
+    wa.cell(15, 1, f"Revenue growth ({_fyl[0]}→{_fyl[-1]})").font = Font(bold=True, color=NAVY)
     for i, g in enumerate(asmp["growth"]):
         c = wa.cell(15, 2 + i, g)
         c.number_format = pct
         c.fill = PatternFill("solid", fgColor="FFF7E0")
         c.border = border
+    wa.cell(16, 1, "  ↳ growth basis").font = Font(italic=True, color=GREY, size=9)
+    gsc = wa.cell(16, 2, src.get("growth", "3yr historical avg + management guidance"))
+    gsc.font = Font(italic=True, color=GREY, size=9)
+    wa.merge_cells("B16:F16")
+    # EBIT margin PATH across Year 1..5 → B17:F17 (drives the model per year)
+    wa.cell(17, 1, f"EBIT margin ({_fyl[0]}→{_fyl[-1]})").font = Font(bold=True, color=NAVY)
+    for i, m in enumerate(_m_list):
+        c = wa.cell(17, 2 + i, m)
+        c.number_format = pct
+        c.fill = PatternFill("solid", fgColor="FFF7E0")
+        c.border = border
+    wa.cell(18, 1, "  ↳ margin basis").font = Font(italic=True, color=GREY, size=9)
+    msc = wa.cell(18, 2, src.get("ebit_margin", "trailing margin + operating leverage path"))
+    msc.font = Font(italic=True, color=GREY, size=9)
+    wa.merge_cells("B18:F18")
     wa.column_dimensions["A"].width = 26
-    for col in "BCDEF":
+    wa.column_dimensions["B"].width = 13
+    wa.column_dimensions["C"].width = 46
+    for col in "DEF":
         wa.column_dimensions[col].width = 12
 
     # ── MODEL (DCF, fully formula-linked to ASSUMPTIONS) ──
@@ -729,10 +1051,11 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
     wm["A1"].fill = hdr_fill
     wm["A1"].font = hdr_font
     cols = ["B", "C", "D", "E", "F"]  # Year 1..5
-    wm.cell(2, 1, "Line item").font = Font(bold=True, color="FFFFFF")
+    ylabels = fy_labels(d)
+    wm.cell(2, 1, "Line item (₹ Cr)").font = Font(bold=True, color="FFFFFF")
     wm.cell(2, 1).fill = PatternFill("solid", fgColor=NAVY)
     for i, col in enumerate(cols):
-        c = wm.cell(2, 2 + i, f"Year {i+1}")
+        c = wm.cell(2, 2 + i, ylabels[i])
         c.font = Font(bold=True, color="FFFFFF")
         c.fill = PatternFill("solid", fgColor=NAVY)
     # Revenue (row3): Yr1 grows base; each next grows previous
@@ -743,7 +1066,7 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
         wm[f"{cur}3"] = f"={prev}3*(1+ASSUMPTIONS!{cur}15)"
     # EBIT, NOPAT, D&A, Capex, ΔNWC, FCF, DF, PV
     for i, col in enumerate(cols):
-        wm[f"{col}4"] = f"={col}3*ASSUMPTIONS!$B$4"                       # EBIT
+        wm[f"{col}4"] = f"={col}3*ASSUMPTIONS!{col}17"                    # EBIT (per-year margin path)
         wm[f"{col}5"] = f"={col}4*(1-ASSUMPTIONS!$B$5)"                   # NOPAT
         wm[f"{col}6"] = f"={col}3*ASSUMPTIONS!$B$7"                       # D&A
         wm[f"{col}7"] = f"={col}3*ASSUMPTIONS!$B$6"                       # Capex
@@ -790,6 +1113,243 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
     fvc = cover.cell(cr, 2, "=MODEL!B20"); fvc.number_format = "#,##0.00"; fvc.font = Font(bold=True, color=ARC)
     cover.cell(cr + 1, 1, "Upside / (downside)").font = Font(bold=True, color=NAVY)
     uc = cover.cell(cr + 1, 2, "=MODEL!B22"); uc.number_format = pct; uc.font = Font(bold=True, color=ARC)
+
+    # ── CONSENSUS (street vs our view) ──
+    cons = consensus_summary(d)
+    if cons:
+        wc = wb.create_sheet("CONSENSUS")
+        wc.sheet_view.showGridLines = False
+        wc.append(["Street Consensus vs Our View", ""])
+        style_header(wc, 1, 2)
+        ours_t = ((narrative or {}).get("price_target")) or python_dcf(asmp)["fair_value"]
+        rows = [
+            ("Street recommendation", cons["rec"] or "—"),
+            ("Street mean target (₹)", f"{cons['mean']:,.0f}"),
+            ("Street target range (₹)", f"{cons['low']:,.0f} – {cons['high']:,.0f}" if cons.get("low") and cons.get("high") else "—"),
+            ("Analysts covering", cons["n"] or "—"),
+            ("Street implied upside", f"{cons['upside_pct']:+.0f}%"),
+            ("— Our recommendation", final_verdict(a, narrative)),
+            ("Our target (₹)", f"{ours_t:,.0f}" if ours_t else "—"),
+            ("Our gap vs street", f"{(ours_t/cons['mean']-1)*100:+.0f}%" if ours_t else "—"),
+        ]
+        for k, v in rows:
+            wc.append([k, v])
+            if k.startswith("—") or k.startswith("Our"):
+                wc.cell(wc.max_row, 1).font = Font(bold=True, color=ARC)
+        if (narrative or {}).get("vs_consensus"):
+            wc.append([])
+            wc.append(["Why our view differs:", ""])
+            wc.cell(wc.max_row, 1).font = Font(bold=True, color=NAVY)
+            wc.append([narrative["vs_consensus"], ""])
+            wc.cell(wc.max_row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+        if (narrative or {}).get("divergence_factor"):
+            wc.append(["Key fundamental difference:", ""])
+            wc.cell(wc.max_row, 1).font = Font(bold=True, color=ARC)
+            wc.append([narrative["divergence_factor"], ""])
+            wc.cell(wc.max_row, 1).alignment = Alignment(wrap_text=True, vertical="top")
+        for row in wc.iter_rows(min_row=1, max_row=wc.max_row, max_col=2):
+            for cell in row:
+                cell.border = border
+        wc.column_dimensions["A"].width = 26
+        wc.column_dimensions["B"].width = 60
+
+    # ── BROKERS (named ratings + distribution) ──
+    rd = d.get("rating_dist")
+    brk = d.get("brokers") or []
+    if rd or brk:
+        wbk = wb.create_sheet("BROKERS")
+        wbk.sheet_view.showGridLines = False
+        wbk.append(["Analyst Ratings", "", "", ""])
+        style_header(wbk, 1, 4)
+        if rd:
+            total = sum(rd.values())
+            wbk.append(["Rating distribution", f"{total} analysts", "", ""])
+            wbk.cell(wbk.max_row, 1).font = Font(bold=True, color=NAVY)
+            for lbl, key in [("Strong Buy", "strong_buy"), ("Buy", "buy"), ("Hold", "hold"),
+                             ("Sell", "sell"), ("Strong Sell", "strong_sell")]:
+                wbk.append([lbl, rd.get(key, 0), "", ""])
+            wbk.append([])
+        if brk:
+            hrow = wbk.max_row + 1
+            wbk.append(["Firm", "Rating", "Action", "Date"])
+            for c in wbk[hrow]:
+                c.fill = PatternFill("solid", fgColor=NAVY); c.font = Font(color="FFFFFF", bold=True)
+            for b in brk:
+                wbk.append([b["firm"], b["grade"], b["action"], b["date"]])
+        else:
+            wbk.append(["Named broker actions", "not available for this NSE listing (Yahoo)", "", ""])
+            wbk.cell(wbk.max_row, 1).font = Font(italic=True, color=GREY)
+        for row in wbk.iter_rows(min_row=1, max_row=wbk.max_row, max_col=4):
+            for cell in row:
+                cell.border = border
+        wbk.column_dimensions["A"].width = 30
+        for col in "BCD":
+            wbk.column_dimensions[col].width = 16
+
+    # ── SENSITIVITY (fair value across WACC × terminal growth) ──
+    ws2 = wb.create_sheet("SENSITIVITY")
+    ws2.sheet_view.showGridLines = False
+    ws2.append(["DCF fair value/share (₹) — WACC (rows) × Terminal growth (cols)"])
+    style_header(ws2, 1, 6)
+    base_w, base_t = asmp["wacc"], asmp["terminal_growth"]
+    waccs = [round(base_w + dw, 4) for dw in (-0.02, -0.01, 0, 0.01, 0.02)]
+    tgs = [round(base_t + dt, 4) for dt in (-0.01, -0.005, 0, 0.005, 0.01)]
+    ws2.append(["WACC \\ TGR"] + [f"{t*100:.1f}%" for t in tgs])
+    for w in waccs:
+        rowvals = [f"{w*100:.1f}%"]
+        for t in tgs:
+            aa = dict(asmp); aa["wacc"] = w; aa["terminal_growth"] = min(t, w - 0.01)
+            fvv = python_dcf(aa)["fair_value"]
+            rowvals.append(round(fvv) if fvv else None)
+        ws2.append(rowvals)
+        if abs(w - base_w) < 1e-6:
+            for c in ws2[ws2.max_row]:
+                c.font = Font(bold=True)
+    for row in ws2.iter_rows(min_row=2, max_row=ws2.max_row, max_col=6):
+        for cell in row:
+            cell.border = border
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "#,##0"
+    ws2.column_dimensions["A"].width = 14
+    for col in "BCDEF":
+        ws2.column_dimensions[col].width = 11
+
+    # ── SCENARIOS (bull / base / bear, probability-weighted) ──
+    scen = (narrative or {}).get("scenarios")
+    if scen:
+        wsn = wb.create_sheet("SCENARIOS")
+        wsn.sheet_view.showGridLines = False
+        wsn.append(["Scenario", "Target (₹)", "Upside", "Probability", "Key driver"])
+        style_header(wsn, 1, 5)
+        price = d["price"]
+        ev_sum = 0.0
+        for key in ("bull", "base", "bear"):
+            s = scen.get(key) or {}
+            tgt = s.get("target")
+            prob = s.get("probability")
+            up = f"{(tgt/price-1)*100:+.0f}%" if tgt else "—"
+            wsn.append([key.capitalize(), round(tgt) if tgt else "—", up,
+                        f"{prob*100:.0f}%" if prob is not None else "—", s.get("driver", "")])
+            if tgt and prob:
+                ev_sum += tgt * prob
+        wsn.append([])
+        wsn.append(["Probability-weighted target", round(ev_sum) if ev_sum else "—",
+                    f"{(ev_sum/price-1)*100:+.0f}%" if ev_sum else "—", "", ""])
+        wsn.cell(wsn.max_row, 1).font = Font(bold=True, color=ARC)
+        wsn.cell(wsn.max_row, 2).font = Font(bold=True, color=ARC)
+        for row in wsn.iter_rows(min_row=1, max_row=wsn.max_row, max_col=5):
+            for cell in row:
+                cell.border = border
+        for col, w in zip("ABCDE", (14, 12, 10, 12, 46)):
+            wsn.column_dimensions[col].width = w
+
+    n = narrative or {}
+    price = d["price"]
+
+    # ── COMPS (market comparables) ──
+    comps = n.get("comps")
+    if comps and comps.get("peers"):
+        wcp = wb.create_sheet("COMPS")
+        wcp.sheet_view.showGridLines = False
+        wcp.append(["Peer", "EV/EBITDA", "P/E"])
+        style_header(wcp, 1, 3)
+        for pr in comps["peers"]:
+            wcp.append([pr.get("name", ""), pr.get("ev_ebitda"), pr.get("pe")])
+        wcp.append([])
+        wcp.append(["Peer median EV/EBITDA", comps.get("median_ev_ebitda"), ""])
+        wcp.append(["Peer median P/E", comps.get("median_pe"), ""])
+        iv = comps.get("implied_value_per_share")
+        wcp.append(["Implied value / share (₹)", round(iv) if iv else "—", ""])
+        wcp.cell(wcp.max_row, 1).font = Font(bold=True, color=ARC)
+        wcp.cell(wcp.max_row, 2).font = Font(bold=True, color=ARC)
+        if comps.get("note"):
+            wcp.append([]); wcp.append([comps["note"], "", ""])
+            wcp.cell(wcp.max_row, 1).font = Font(italic=True, color=GREY)
+        for row in wcp.iter_rows(min_row=1, max_row=wcp.max_row, max_col=3):
+            for c in row:
+                c.border = border
+        wcp.column_dimensions["A"].width = 28
+        for col in "BC":
+            wcp.column_dimensions[col].width = 14
+
+    # ── SOTP (sum-of-the-parts) ──
+    sotp = n.get("sotp")
+    if sotp and sotp.get("segments"):
+        wso = wb.create_sheet("SOTP")
+        wso.sheet_view.showGridLines = False
+        wso.append(["Segment", "Basis", "Metric (₹Cr)", "Multiple", "EV (₹Cr)"])
+        style_header(wso, 1, 5)
+        ev_total = 0.0
+        for s in sotp["segments"]:
+            ev = s.get("ev_cr") or 0
+            ev_total += ev
+            wso.append([s.get("segment", ""), s.get("basis", ""), s.get("metric_cr"),
+                        s.get("multiple"), round(ev) if ev else "—"])
+        wso.append(["Enterprise value", "", "", "", round(ev_total)])
+        nd = sotp.get("net_debt_cr", 0) or 0
+        wso.append(["Less: net debt", "", "", "", round(nd)])
+        wso.append(["Equity value", "", "", "", round(ev_total - nd)])
+        ivs = sotp.get("implied_value_per_share")
+        wso.append(["Implied value / share (₹)", "", "", "", round(ivs) if ivs else "—"])
+        for rr in range(wso.max_row - 3, wso.max_row + 1):
+            wso.cell(rr, 1).font = Font(bold=True, color=NAVY)
+        wso.cell(wso.max_row, 1).font = Font(bold=True, color=ARC)
+        wso.cell(wso.max_row, 5).font = Font(bold=True, color=ARC)
+        if sotp.get("note"):
+            wso.append([]); wso.append([sotp["note"], "", "", "", ""])
+        for row in wso.iter_rows(min_row=1, max_row=wso.max_row, max_col=5):
+            for c in row:
+                c.border = border
+        wso.column_dimensions["A"].width = 26
+        for col in "BCDE":
+            wso.column_dimensions[col].width = 14
+
+    # ── FOOTBALL FIELD (valuation range across methods + bar chart) ──
+    methods = []
+    dcf_fv = python_dcf(asmp)["fair_value"] if asmp else None
+    if dcf_fv:
+        methods.append(("DCF", dcf_fv * 0.85, dcf_fv * 1.15))
+    if comps and comps.get("implied_value_per_share"):
+        c = comps["implied_value_per_share"]; methods.append(("Comps", c * 0.9, c * 1.1))
+    if sotp and sotp.get("implied_value_per_share"):
+        s = sotp["implied_value_per_share"]; methods.append(("SOTP", s * 0.9, s * 1.1))
+    cons = consensus_summary(d)
+    if cons and cons.get("low") and cons.get("high"):
+        methods.append(("Analyst targets", cons["low"], cons["high"]))
+    if d.get("wk_low") and d.get("wk_high"):
+        methods.append(("52-week range", d["wk_low"], d["wk_high"]))
+    if len(methods) >= 2:
+        wff = wb.create_sheet("FOOTBALL_FIELD")
+        wff.sheet_view.showGridLines = False
+        wff.append(["Method", "Low (₹)", "High (₹)", "Base (hidden)", "Range"])
+        style_header(wff, 1, 5)
+        for name, lo, hi in methods:
+            wff.append([name, round(lo), round(hi), round(lo), round(hi - lo)])
+        wff.append(["Current price", round(price), round(price), "", ""])
+        for row in wff.iter_rows(min_row=1, max_row=wff.max_row, max_col=5):
+            for c in row:
+                c.border = border
+                if isinstance(c.value, (int, float)):
+                    c.number_format = "#,##0"
+        wff.column_dimensions["A"].width = 18
+        for col in "BCDE":
+            wff.column_dimensions[col].width = 12
+        # stacked horizontal bar → floating "range" bars = football field
+        nrows = len(methods)
+        chart = BarChart()
+        chart.type = "bar"; chart.grouping = "stacked"; chart.overlap = 100
+        chart.title = "Football Field — Valuation Range (₹/share)"
+        chart.height = 8; chart.width = 18
+        cats = Reference(wff, min_col=1, min_row=2, max_row=1 + nrows)
+        base = Reference(wff, min_col=4, min_row=1, max_row=1 + nrows)   # hidden base
+        rng = Reference(wff, min_col=5, min_row=1, max_row=1 + nrows)    # visible range
+        chart.add_data(base, titles_from_data=True)
+        chart.add_data(rng, titles_from_data=True)
+        chart.set_categories(cats)
+        chart.series[0].graphicalProperties.noFill = True   # base invisible
+        chart.series[1].graphicalProperties.solidFill = ARC
+        chart.legend = None
+        wff.add_chart(chart, "G2")
 
     # ── ANALYSIS (Claude narrative, grounded on real data) ──
     if narrative:
@@ -840,10 +1400,12 @@ def build_pdf(d: dict, a: dict, narrative=None) -> bytes:
                             leftMargin=16 * mm, rightMargin=16 * mm,
                             topMargin=16 * mm, bottomMargin=16 * mm)
     ss = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=ss["Title"], textColor=colors.HexColor("#" + NAVY), fontSize=18, spaceAfter=2)
-    sub = ParagraphStyle("sub", parent=ss["Normal"], textColor=colors.HexColor("#" + GREY), fontSize=9, spaceAfter=10)
-    hh = ParagraphStyle("hh", parent=ss["Heading2"], textColor=colors.HexColor("#" + ARC), fontSize=12, spaceBefore=10, spaceAfter=4)
-    body = ParagraphStyle("body", parent=ss["Normal"], fontSize=9.5, leading=13)
+    for _sn in ss.byName:
+        ss[_sn].fontName = PDF_FONT
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontName=PDF_BOLD, textColor=colors.HexColor("#" + NAVY), fontSize=18, spaceAfter=2)
+    sub = ParagraphStyle("sub", parent=ss["Normal"], fontName=PDF_FONT, textColor=colors.HexColor("#" + GREY), fontSize=9, spaceAfter=10)
+    hh = ParagraphStyle("hh", parent=ss["Heading2"], fontName=PDF_BOLD, textColor=colors.HexColor("#" + ARC), fontSize=12, spaceBefore=10, spaceAfter=4)
+    body = ParagraphStyle("body", parent=ss["Normal"], fontName=PDF_FONT, fontSize=9.5, leading=13)
     story = []
 
     story.append(Paragraph("J.A.R.V.I.S. · Institutional Equity Research", h1))
@@ -852,13 +1414,13 @@ def build_pdf(d: dict, a: dict, narrative=None) -> bytes:
     # Recommendation banner
     verdict = final_verdict(a, narrative)
     verdict_tbl = Table([[f"{d['name']}  ({d['symbol']})", f"{verdict}"]], colWidths=[120 * mm, 45 * mm])
-    verdict_tbl.setStyle(TableStyle([
+    verdict_tbl.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#" + NAVY)),
         ("TEXTCOLOR", (0, 0), (0, 0), colors.white),
         ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#" + ARC)),
         ("FONTSIZE", (0, 0), (0, 0), 12),
         ("FONTSIZE", (1, 0), (1, 0), 14),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("FONTNAME", (0, 0), (-1, -1), PDF_BOLD),
         ("ALIGN", (1, 0), (1, 0), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 8),
@@ -900,12 +1462,12 @@ def build_pdf(d: dict, a: dict, narrative=None) -> bytes:
         ["52-wk", f"₹{d.get('wk_low',0):,.0f}–₹{d.get('wk_high',0):,.0f}" if d.get("wk_high") else "N/A", "200-DMA", f"₹{d['dma200']:,.0f}" if d.get("dma200") else "N/A"],
     ]
     t = Table(snap, colWidths=[30 * mm, 52 * mm, 30 * mm, 53 * mm])
-    t.setStyle(TableStyle([
+    t.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D7DE")),
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#" + LIGHT)),
         ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#" + LIGHT)),
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTNAME", (0, 0), (0, -1), PDF_BOLD),
+        ("FONTNAME", (2, 0), (2, -1), PDF_BOLD),
         ("FONTSIZE", (0, 0), (-1, -1), 9),
         ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
@@ -919,13 +1481,14 @@ def build_pdf(d: dict, a: dict, narrative=None) -> bytes:
     data.append(["COMPOSITE", f"{a['score']}/{a['n']}", a["verdict"], f"{a['norm']:.2f}"])
     st = Table(data, colWidths=[42 * mm, 40 * mm, 45 * mm, 18 * mm])
     style = [
+        ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#" + NAVY)),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 0), (-1, 0), PDF_BOLD),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D7DE")),
         ("FONTSIZE", (0, 0), (-1, -1), 8.5),
         ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#" + LIGHT)),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), PDF_BOLD),
         ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]
     story.append(Table(data, colWidths=[42 * mm, 40 * mm, 45 * mm, 18 * mm], style=TableStyle(style)))
@@ -941,6 +1504,90 @@ def build_pdf(d: dict, a: dict, narrative=None) -> bytes:
             f"implying <b>{dcf['upside']*100:+.0f}%</b>.", body))
     else:
         story.append(Paragraph(dcf["note"], body))
+
+    # Scenario analysis (bull / base / bear)
+    scen = (narrative or {}).get("scenarios")
+    if scen:
+        story.append(Paragraph("Scenario Analysis", hh))
+        sdata = [["Scenario", "Target (₹)", "Upside", "Prob.", "Driver"]]
+        ev = 0.0
+        for key in ("bull", "base", "bear"):
+            s = scen.get(key) or {}
+            tg = s.get("target"); pr = s.get("probability")
+            sdata.append([key.capitalize(), f"{tg:,.0f}" if tg else "—",
+                          f"{(tg/d['price']-1)*100:+.0f}%" if tg else "—",
+                          f"{pr*100:.0f}%" if pr is not None else "—", s.get("driver", "")])
+            if tg and pr:
+                ev += tg * pr
+        if ev:
+            sdata.append(["Weighted", f"{ev:,.0f}", f"{(ev/d['price']-1)*100:+.0f}%", "", ""])
+        st = Table(sdata, colWidths=[22 * mm, 26 * mm, 20 * mm, 16 * mm, 81 * mm])
+        st.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#" + NAVY)),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTNAME", (0, 0), (-1, 0), PDF_BOLD),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D7DE")), ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#" + LIGHT)), ("FONTNAME", (0, -1), (-1, -1), PDF_BOLD),
+            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        story.append(st)
+
+    # Valuation football field (methods → range)
+    _comps = (narrative or {}).get("comps")
+    _sotp = (narrative or {}).get("sotp")
+    _cons0 = consensus_summary(d)
+    frows = [["Method", "Low (₹)", "High (₹)"]]
+    if dcf["fair_value"]:
+        frows.append(["DCF", f"{dcf['fair_value']*0.85:,.0f}", f"{dcf['fair_value']*1.15:,.0f}"])
+    if _comps and _comps.get("implied_value_per_share"):
+        c = _comps["implied_value_per_share"]; frows.append(["Comps", f"{c*0.9:,.0f}", f"{c*1.1:,.0f}"])
+    if _sotp and _sotp.get("implied_value_per_share"):
+        s = _sotp["implied_value_per_share"]; frows.append(["SOTP", f"{s*0.9:,.0f}", f"{s*1.1:,.0f}"])
+    if _cons0 and _cons0.get("low") and _cons0.get("high"):
+        frows.append(["Analyst targets", f"{_cons0['low']:,.0f}", f"{_cons0['high']:,.0f}"])
+    if d.get("wk_low") and d.get("wk_high"):
+        frows.append(["52-week range", f"{d['wk_low']:,.0f}", f"{d['wk_high']:,.0f}"])
+    if len(frows) >= 3:
+        story.append(Paragraph("Valuation Football Field", hh))
+        ff = Table(frows, colWidths=[45 * mm, 40 * mm, 40 * mm])
+        ff.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#" + NAVY)), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), PDF_BOLD), ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D7DE")),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        story.append(ff)
+        story.append(Paragraph(f"<i>Current price ₹{d['price']:,.0f}. Full chart, Comps and SOTP sheets in the Excel model.</i>",
+                     ParagraphStyle("ffn", parent=body, fontSize=7.5, textColor=colors.HexColor("#" + GREY))))
+
+    # Street consensus vs our view
+    cons = consensus_summary(d)
+    if cons:
+        story.append(Paragraph("Street Consensus vs Our View", hh))
+        ours_t = (narrative or {}).get("price_target") or dcf.get("fair_value")
+        crows = [["", "Recommendation", "Target (₹)", "Implied"]]
+        crows.append(["Street", cons["rec"] or "—", f"{cons['mean']:,.0f}", f"{cons['upside_pct']:+.0f}%"])
+        crows.append(["J.A.R.V.I.S.", verdict, f"{ours_t:,.0f}" if ours_t else "—",
+                      f"{(ours_t/d['price']-1)*100:+.0f}%" if ours_t else "—"])
+        ct = Table(crows, colWidths=[35 * mm, 45 * mm, 40 * mm, 45 * mm])
+        ct.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#" + NAVY)),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), PDF_BOLD),
+            ("FONTNAME", (0, 2), (0, 2), PDF_BOLD),
+            ("TEXTCOLOR", (0, 2), (-1, 2), colors.HexColor("#" + ARC)),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D7DE")),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(ct)
+        rd = d.get("rating_dist")
+        if rd:
+            story.append(Spacer(1, 2))
+            story.append(Paragraph(
+                f"Ratings: {rd.get('strong_buy',0)} strong-buy · {rd.get('buy',0)} buy · "
+                f"{rd.get('hold',0)} hold · {rd.get('sell',0)} sell · {rd.get('strong_sell',0)} strong-sell", body))
+        if (narrative or {}).get("vs_consensus"):
+            story.append(Spacer(1, 3))
+            story.append(Paragraph(f"<i>{narrative['vs_consensus']}</i>", body))
+        if (narrative or {}).get("divergence_factor"):
+            story.append(Paragraph(f"<b>Key fundamental difference:</b> {narrative['divergence_factor']}", body))
 
     story.append(Paragraph("Recommendation", hh))
     rec_text = narrative.get("recommendation") if narrative else a["action"]
@@ -1052,6 +1699,252 @@ def prepare(symbol: str):
     return d, a
 
 
+def build_prompt_short(d: dict, a: dict):
+    """Short-term (6-12 month) technical + catalyst trade note. No DCF."""
+    t = d.get("tech") or {}
+    price = d["price"]
+    rr = lambda x, m=1: round(x * m, 2) if x is not None else None
+    facts = {
+        "company": d["name"], "symbol": d["symbol"], "sector": d["sector"], "industry": d["industry"],
+        "price_inr": round(price, 2),
+        "ma20": rr(t.get("ma20")), "ma50": rr(t.get("ma50")), "ma200": rr(t.get("ma200")),
+        "rsi14": round(t["rsi"], 1) if t.get("rsi") is not None else None,
+        "return_1m_pct": rr(t.get("ret_1m"), 100), "return_3m_pct": rr(t.get("ret_3m"), 100),
+        "return_6m_pct": rr(t.get("ret_6m"), 100), "annual_vol_pct": rr(t.get("vol"), 100),
+        "support_3m": rr(t.get("support")), "resistance_3m": rr(t.get("resistance")),
+        "wk_high": d.get("wk_high"), "wk_low": d.get("wk_low"), "trailing_pe": d.get("pe"),
+    }
+    cons = consensus_summary(d)
+    if cons:
+        facts["street_consensus"] = {"mean_target_inr": round(cons["mean"]),
+                                     "recommendation": cons["rec"], "num_analysts": cons["n"]}
+    system = (
+        "You are the head of a technical / quant trading desk writing a SHORT-TERM (6-12 month) "
+        "positional trade note. DCF and intrinsic valuation are NOT relevant on this horizon — base your "
+        "view on price trend, moving averages (20/50/200-DMA), RSI, momentum, key support/resistance "
+        "levels, volatility, and near-term catalysts (earnings, events, sector flows). Use ONLY the "
+        "verified figures — never invent a number. Set actionable levels consistent with those figures."
+    )
+    user = (
+        f"Produce a 6-12 month technical & catalyst trade note for {d['name']} ({d['symbol']}).\n\n"
+        f"VERIFIED FIGURES:\n{json.dumps(facts, indent=2)}\n\n"
+        "Return ONLY strict JSON (no fences, comments, or trailing commas) with keys:\n"
+        "- thesis: 2-3 sentence short-term setup (trend + momentum)\n"
+        "- trend: 1-2 sentences reading the DMAs, RSI and momentum\n"
+        "- bull_case: array of 3 short points\n- bear_case: array of 3 short points\n"
+        "- catalysts: array of 2-3 near-term catalysts with rough timing (next 6-12 months)\n"
+        "- risks: array of 2 key risks\n"
+        "- verdict: one of BUY, ACCUMULATE, HOLD, REDUCE, SELL (the 6-12 month trade call)\n"
+        "- verdict_rationale: one short clause under 16 words\n"
+        "- levels: object {entry, target, stop, support, resistance} — INR numbers, realistic vs price\n"
+        "- price_target: 6-12 month target (INR number)\n"
+        "- recommendation: 2 sentence rationale for the trade\n"
+        "- vs_consensus: 1-2 sentences comparing to street_consensus if present, else empty string\n"
+        'Example: {"thesis":"...","trend":"...","bull_case":["..."],"bear_case":["..."],'
+        '"catalysts":["..."],"risks":["..."],"verdict":"ACCUMULATE","verdict_rationale":"Uptrend, RSI neutral, buy dips",'
+        '"levels":{"entry":1450,"target":1650,"stop":1360,"support":1400,"resistance":1600},'
+        '"price_target":1650,"recommendation":"...","vs_consensus":"..."}'
+    )
+    return system, user
+
+
+def compose_short(d: dict, a: dict, narrative, result: dict):
+    """Chat + speech for the short-term technical note (no DCF)."""
+    n = narrative or {}
+    t = d.get("tech") or {}
+    price = d["price"]
+    verdict = final_verdict(a, narrative)
+    tgt = result.get("price_target")
+    lv = n.get("levels") or {}
+    sector = d.get("industry") or d.get("sector") or ""
+    thesis = (n.get("thesis") or "Short-term technical view.").strip()
+    thesis_first = thesis.split(". ")[0].rstrip(".") + "."
+    rationale = (n.get("verdict_rationale") or "").strip()
+    intro = f"{d['name']}, {sector}." if sector else f"{d['name']}."
+    final_line = f"Short-term call: {verdict}" + (f", {rationale}" if rationale else "") + \
+                 (f". Target {tgt:,.0f} rupees." if tgt else ".")
+    speech = " ".join([intro, thesis_first, final_line])
+
+    pn = lambda x: f"₹{x:,.0f}" if x is not None else "—"
+    p = [f"**{d['name']} ({d['symbol']})** · ₹{price:,.0f}  ·  _Short-term (6–12 mo) · technical view_"]
+    tl = []
+    if t.get("rsi") is not None: tl.append(f"RSI {t['rsi']:.0f}")
+    if t.get("ma50"): tl.append(f"50-DMA ₹{t['ma50']:,.0f}")
+    if t.get("ma200"): tl.append(f"200-DMA ₹{t['ma200']:,.0f}")
+    if t.get("ret_1m") is not None: tl.append(f"1M {t['ret_1m']*100:+.1f}%")
+    if t.get("ret_3m") is not None: tl.append(f"3M {t['ret_3m']*100:+.1f}%")
+    if t.get("ret_6m") is not None: tl.append(f"6M {t['ret_6m']*100:+.1f}%")
+    if t.get("vol") is not None: tl.append(f"vol {t['vol']*100:.0f}%")
+    if tl: p.append(" · ".join(tl))
+    p.append(f"**Thesis.** {thesis}")
+    if n.get("trend"): p.append(f"**Technical read.** {n['trend']}")
+    if n.get("bull_case"): p.append("**Bull:**\n" + "\n".join(f"- {x}" for x in n["bull_case"]))
+    if n.get("bear_case"): p.append("**Bear:**\n" + "\n".join(f"- {x}" for x in n["bear_case"]))
+    if n.get("catalysts"): p.append("**Catalysts:**\n" + "\n".join(f"- {x}" for x in n["catalysts"]))
+    if n.get("risks"): p.append("**Risks:**\n" + "\n".join(f"- {x}" for x in n["risks"]))
+    kl = ["**Key levels**",
+          f"Support {pn(lv.get('support') or t.get('support'))} · Resistance {pn(lv.get('resistance') or t.get('resistance'))}",
+          f"Entry {pn(lv.get('entry'))} · Target {pn(lv.get('target') or tgt)} · Stop {pn(lv.get('stop'))}"]
+    if lv.get("target") and lv.get("stop") and lv.get("entry") and lv["entry"] != lv["stop"]:
+        rrr = (lv["target"] - lv["entry"]) / (lv["entry"] - lv["stop"])
+        kl.append(f"Risk : reward ≈ {rrr:.1f} : 1")
+    p.append("\n".join(kl))
+    cons = consensus_summary(d)
+    if cons:
+        cl = ["**Street consensus vs our view**",
+              f"Street: **{cons['rec'] or 'N/A'}** · target ₹{cons['mean']:,.0f} ({cons['upside_pct']:+.0f}%)"]
+        if tgt: cl.append(f"Ours: **{verdict}** · target ₹{tgt:,.0f}")
+        if n.get("vs_consensus"): cl.append(n["vs_consensus"])
+        p.append("\n".join(cl))
+    p.append("_📊 Technical summary in the downloaded Excel + PDF · No DCF (short-term horizon)._")
+    rec = (n.get("recommendation") or a["action"]).strip()
+    p.append(f"**Recommendation: {verdict}**\n{rec}")
+    return "\n\n".join(p), speech
+
+
+def build_excel_short(d: dict, a: dict, narrative) -> bytes:
+    """Compact technical workbook for short-term (Cover · Technicals · Analysis)."""
+    n = narrative or {}
+    t = d.get("tech") or {}
+    lv = n.get("levels") or {}
+    wb = Workbook()
+    thin = Side(style="thin", color="D0D7DE")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hf = PatternFill("solid", fgColor=NAVY)
+    hfont = Font(color="FFFFFF", bold=True, size=11)
+    verdict = final_verdict(a, narrative)
+
+    ws = wb.active
+    ws.title = "COVER"
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "J.A.R.V.I.S. · SHORT-TERM TECHNICAL NOTE (6-12 MONTHS)"
+    ws["A1"].fill = hf; ws["A1"].font = Font(color="FFFFFF", bold=True, size=14)
+    ws.merge_cells("A1:D1")
+    rows = [("Company", d["name"]), ("Symbol", d["symbol"]), ("Price (₹)", f"{d['price']:,.2f}"),
+            ("Call", verdict), ("Target (₹)", f"{n.get('price_target'):,.0f}" if n.get("price_target") else "—"),
+            ("Report Date", datetime.now().strftime("%d %b %Y"))]
+    r = 3
+    for k, v in rows:
+        ws.cell(r, 1, k).font = Font(bold=True, color=NAVY)
+        ws.cell(r, 2, v)
+        if k == "Call": ws.cell(r, 2).font = Font(bold=True, size=13, color=ARC)
+        r += 1
+    ws.column_dimensions["A"].width = 18; ws.column_dimensions["B"].width = 46
+
+    wt = wb.create_sheet("TECHNICALS")
+    wt.sheet_view.showGridLines = False
+    wt.append(["Indicator", "Value"]);
+    for c in wt[1]: c.fill = hf; c.font = hfont; c.border = border
+    tvals = [
+        ("Price", f"₹{d['price']:,.2f}"),
+        ("RSI (14)", f"{t['rsi']:.0f}" if t.get("rsi") is not None else "—"),
+        ("20-DMA", f"₹{t['ma20']:,.0f}" if t.get("ma20") else "—"),
+        ("50-DMA", f"₹{t['ma50']:,.0f}" if t.get("ma50") else "—"),
+        ("200-DMA", f"₹{t['ma200']:,.0f}" if t.get("ma200") else "—"),
+        ("1-month return", f"{t['ret_1m']*100:+.1f}%" if t.get("ret_1m") is not None else "—"),
+        ("3-month return", f"{t['ret_3m']*100:+.1f}%" if t.get("ret_3m") is not None else "—"),
+        ("6-month return", f"{t['ret_6m']*100:+.1f}%" if t.get("ret_6m") is not None else "—"),
+        ("Annualised volatility", f"{t['vol']*100:.0f}%" if t.get("vol") is not None else "—"),
+        ("52-week range", f"₹{d.get('wk_low',0):,.0f} – ₹{d.get('wk_high',0):,.0f}" if d.get("wk_high") else "—"),
+        ("Support (3m)", f"₹{(lv.get('support') or t.get('support') or 0):,.0f}"),
+        ("Resistance (3m)", f"₹{(lv.get('resistance') or t.get('resistance') or 0):,.0f}"),
+        ("Entry", f"₹{lv.get('entry'):,.0f}" if lv.get("entry") else "—"),
+        ("Target (6-12m)", f"₹{lv.get('target') or n.get('price_target'):,.0f}" if (lv.get("target") or n.get("price_target")) else "—"),
+        ("Stop-loss", f"₹{lv.get('stop'):,.0f}" if lv.get("stop") else "—"),
+    ]
+    for k, v in tvals:
+        wt.append([k, v])
+    for row in wt.iter_rows(min_row=1, max_row=wt.max_row, max_col=2):
+        for cell in row: cell.border = border
+    wt.column_dimensions["A"].width = 24; wt.column_dimensions["B"].width = 26
+
+    if n:
+        wa = wb.create_sheet("ANALYSIS")
+        wa.sheet_view.showGridLines = False
+        wa.column_dimensions["A"].width = 100
+        row = 1
+        def sec(title, content):
+            nonlocal row
+            c = wa.cell(row, 1, title); c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor=ARC)
+            row += 1
+            items = content if isinstance(content, list) else [content]
+            for it in items:
+                cc = wa.cell(row, 1, (f"•  {it}" if isinstance(content, list) else str(it)))
+                cc.alignment = Alignment(wrap_text=True, vertical="top"); row += 1
+            row += 1
+        sec("THESIS", n.get("thesis", "—"))
+        if n.get("trend"): sec("TECHNICAL READ", n["trend"])
+        if n.get("bull_case"): sec("BULL", n["bull_case"])
+        if n.get("bear_case"): sec("BEAR", n["bear_case"])
+        if n.get("catalysts"): sec("CATALYSTS", n["catalysts"])
+        if n.get("risks"): sec("RISKS", n["risks"])
+        sec("RECOMMENDATION", n.get("recommendation", a["action"]))
+        if n.get("vs_consensus"): sec("VS STREET CONSENSUS", n["vs_consensus"])
+
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+def build_pdf_short(d: dict, a: dict, narrative) -> bytes:
+    """Compact short-term technical PDF note."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm,
+                            topMargin=16 * mm, bottomMargin=16 * mm)
+    ss = getSampleStyleSheet()
+    for _sn in ss.byName:
+        ss[_sn].fontName = PDF_FONT
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontName=PDF_BOLD, textColor=colors.HexColor("#" + NAVY), fontSize=17, spaceAfter=2)
+    sub = ParagraphStyle("sub", parent=ss["Normal"], fontName=PDF_FONT, textColor=colors.HexColor("#" + GREY), fontSize=9, spaceAfter=10)
+    hh = ParagraphStyle("hh", parent=ss["Heading2"], fontName=PDF_BOLD, textColor=colors.HexColor("#" + ARC), fontSize=12, spaceBefore=9, spaceAfter=4)
+    body = ParagraphStyle("body", parent=ss["Normal"], fontName=PDF_FONT, fontSize=9.5, leading=13)
+    n = narrative or {}; t = d.get("tech") or {}; lv = n.get("levels") or {}
+    verdict = final_verdict(a, narrative)
+    g = lambda x, f="₹{:,.0f}": f.format(x) if x is not None else "N/A"
+    story = [Paragraph("J.A.R.V.I.S. · Short-Term Technical Note", h1),
+             Paragraph(datetime.now().strftime("%d %B %Y") + " · 6-12 month horizon · Not investment advice", sub)]
+    vt = Table([[f"{d['name']} ({d['symbol']})", verdict]], colWidths=[120 * mm, 45 * mm])
+    vt.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), PDF_FONT),("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#" + NAVY)),
+        ("TEXTCOLOR", (0, 0), (0, 0), colors.white), ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#" + ARC)),
+        ("FONTNAME", (0, 0), (-1, -1), PDF_BOLD), ("FONTSIZE", (1, 0), (1, 0), 14),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"), ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10)]))
+    story += [vt, Spacer(1, 6)]
+    if n.get("thesis"): story += [Paragraph("Thesis", hh), Paragraph(n["thesis"], body)]
+    if n.get("trend"): story += [Paragraph("Technical Read", hh), Paragraph(n["trend"], body)]
+    story.append(Paragraph("Technical Snapshot", hh))
+    snap = [["RSI(14)", f"{t['rsi']:.0f}" if t.get("rsi") is not None else "N/A", "50-DMA", g(t.get("ma50"))],
+            ["200-DMA", g(t.get("ma200")), "6M return", f"{t['ret_6m']*100:+.1f}%" if t.get("ret_6m") is not None else "N/A"],
+            ["Support", g(lv.get("support") or t.get("support")), "Resistance", g(lv.get("resistance") or t.get("resistance"))],
+            ["Entry", g(lv.get("entry")), "Target", g(lv.get("target") or n.get("price_target"))],
+            ["Stop-loss", g(lv.get("stop")), "Volatility", f"{t['vol']*100:.0f}%" if t.get("vol") is not None else "N/A"]]
+    tb = Table(snap, colWidths=[30 * mm, 52 * mm, 30 * mm, 53 * mm])
+    tb.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), PDF_FONT),("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D7DE")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#" + LIGHT)), ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#" + LIGHT)),
+        ("FONTNAME", (0, 0), (0, -1), PDF_BOLD), ("FONTNAME", (2, 0), (2, -1), PDF_BOLD),
+        ("FONTSIZE", (0, 0), (-1, -1), 9), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    story.append(tb)
+
+    def bl(title, items):
+        if items:
+            story.append(Paragraph(title, hh))
+            for x in items:
+                story.append(Paragraph(f"•&nbsp; {x}", body))
+    bl("Bull Case", n.get("bull_case")); bl("Bear Case", n.get("bear_case"))
+    bl("Catalysts", n.get("catalysts")); bl("Key Risks", n.get("risks"))
+    cons = consensus_summary(d)
+    if cons:
+        story.append(Paragraph("Street Consensus vs Our View", hh))
+        story.append(Paragraph(f"Street: <b>{cons['rec'] or 'N/A'}</b>, mean target ₹{cons['mean']:,.0f} "
+                               f"({cons['upside_pct']:+.0f}%). Ours: <b>{verdict}</b>, target ₹{n.get('price_target',0):,.0f}. "
+                               f"{n.get('vs_consensus','')}", body))
+    story.append(Paragraph("Recommendation", hh))
+    story.append(Paragraph(f"<b>{verdict}.</b> {n.get('recommendation', a['action'])}", body))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("<i>Data: Yahoo Finance (live). Technical note, not personalised investment advice.</i>",
+                 ParagraphStyle("disc", parent=body, fontSize=7.5, textColor=colors.HexColor("#" + GREY))))
+    doc.build(story)
+    return buf.getvalue()
+
+
 def build_prompt(d: dict, a: dict):
     """Build (system, user) for Claude to author the institutional narrative,
     grounded on REAL figures so it doesn't invent numbers."""
@@ -1072,7 +1965,21 @@ def build_prompt(d: dict, a: dict):
         "dcf_fair_value": round(a["dcf"]["fair_value"]) if a["dcf"]["fair_value"] else None,
         "dcf_upside_pct": round(a["dcf"]["upside"] * 100) if a["dcf"]["upside"] is not None else None,
         "quant_verdict": a["verdict"], "quant_score": f"{a['score']}/{a['n']}",
+        "historical_revenue_cagr_pct": round(d["rev_cagr"] * 100, 1) if d.get("rev_cagr") is not None else None,
+        "revenue_history_cr_newest_to_oldest": [round(x) for x in d["rev_hist_cr"]] if d.get("rev_hist_cr") else None,
+        "consensus_revenue_growth_pct": round(d["rev_growth"] * 100, 1) if d.get("rev_growth") is not None else None,
     }
+    cons = consensus_summary(d)
+    if cons:
+        facts["street_consensus"] = {
+            "mean_target_inr": round(cons["mean"]),
+            "target_range_inr": [round(cons["low"]) if cons["low"] else None,
+                                 round(cons["high"]) if cons["high"] else None],
+            "recommendation": cons["rec"],
+            "num_analysts": cons["n"],
+            "implied_upside_pct": round(cons["upside_pct"]),
+            "rating_distribution": d.get("rating_dist"),
+        }
     system = (
         "You are a Managing Director of equity research at a top-tier institutional "
         "desk (think Goldman Sachs / Morgan Stanley), writing a long-horizon (3–5 year) "
@@ -1082,9 +1989,15 @@ def build_prompt(d: dict, a: dict):
         "number, price, ratio, or statistic. Qualitative judgement is yours; data is not.\n"
         "• Think in terms of moat, unit economics, capital allocation, industry structure, "
         "and through-cycle earnings power.\n"
-        "• You ALSO set the forward DCF driver assumptions that will populate a live Excel "
-        "model. Make them defensible and consistent with the company's real margins, growth, "
-        "and balance sheet shown in the figures."
+        "• You are presenting to the investment committee of a sovereign wealth fund (e.g. ADIA/"
+        "Dubai). The workings must be defensible line-by-line — no plain-vanilla shortcuts.\n"
+        "• You set the forward DCF drivers that populate a live Excel model. TRIANGULATE revenue "
+        "growth from THREE anchors and blend them: (1) the company's historical revenue CAGR "
+        "provided, (2) the structural growth rate of its industry (your knowledge), (3) the "
+        "broker/consensus revenue-growth expectation provided. Do NOT just pick a round number or "
+        "a simple fade — show the blend in sources.growth. Do the SAME for the margin/expense path: "
+        "anchor EBIT margin to the trailing margin and model realistic operating leverage / cost "
+        "inflation, not a flat assumption."
     )
     user = (
         f"Produce an institutional long-term research note and DCF driver set for "
@@ -1100,10 +2013,33 @@ def build_prompt(d: dict, a: dict):
         "- risks: array of 2 key risks, most material first\n"
         "- verdict: your FINAL call, exactly one of: BUY, ACCUMULATE, HOLD, REDUCE, SELL\n"
         "- verdict_rationale: ONE short clause under 16 words — the core reason for the call\n"
+        "- vs_consensus: 2-3 sentences comparing YOUR view to the street_consensus in the facts "
+        "(if present) — state where you agree/differ on target and rating, and explain WHY your "
+        "view differs (e.g. more conservative WACC, different growth/margin path, catalyst timing). "
+        "If no consensus is given, return an empty string.\n"
+        "- divergence_factor: name the SINGLE most important FUNDAMENTAL factor where your model differs "
+        "from the street, quantified where possible (e.g. 'We model a 300bps-lower steady-state EBIT "
+        "margin', 'We use a 12.5% WACC vs the street's implied ~10%', 'We assume FY26 revenue growth of "
+        "6% vs consensus ~10% on weaker discretionary demand'). Empty string if no consensus given.\n"
         "- recommendation: 2 sentence rationale for a 3-5 year horizon\n"
         "- price_target: number (your 12-month fair value in INR) or null\n"
+        "- scenarios: object with keys bull, base, bear — each an object "
+        "{target:<INR number>, probability:<decimal, the three sum to ~1>, driver:'<one line: what "
+        "changes vs base — growth/margin/multiple>'}. Base target should match your price_target.\n"
+        "- comps: object for market comparables. peers MUST be the company's 3-5 most DIRECT "
+        "listed competitors — include recent IPOs and pure-play rivals (e.g. for Eternal/Zomato "
+        "include Swiggy; for a private bank its closest private peers; for an EV maker its EV rivals). "
+        "Do NOT list loosely-related large caps if a direct competitor is listed. — {peers: array each "
+        "{name, ev_ebitda:<x>, pe:<x>}, median_ev_ebitda:<number>, median_pe:<number>, "
+        "implied_value_per_share:<INR number applying the peer median to this company>, note:'<1 line>'}.\n"
+        "- sotp: Sum-of-the-Parts — ONLY if the company has distinct segments (e.g. Tata Motors = "
+        "CV+PV+JLR, Reliance = O2C+Retail+Jio); else null. Object {segments: array of "
+        "{segment, basis:'EV/EBITDA'|'EV/Sales'|'P/E', metric_cr:<number>, multiple:<number>, "
+        "ev_cr:<number>}, net_debt_cr:<number>, implied_value_per_share:<INR number>, note:'<1 line>'}.\n"
         "- assumptions: object with decimals: growth (array of 5 yearly revenue-growth "
-        "rates, realistic vs history), ebit_margin (sustainable operating margin), "
+        "rates, realistic vs history), ebit_margin (ARRAY of 5 yearly EBIT margins showing the "
+        "TRAJECTORY — anchor Yr1 to the trailing margin then model realistic expansion or "
+        "compression from operating leverage / cost inflation; do NOT use one flat number), "
         "tax_rate (~0.25 for India), capex_pct, da_pct, nwc_pct (incremental NWC as % of "
         "revenue change), wacc (discount rate reflecting risk), terminal_growth "
         "(long-run, below wacc, ~0.03-0.05).\n"
@@ -1113,18 +2049,36 @@ def build_prompt(d: dict, a: dict):
         "and a one-line note. All decimals.\n"
         "- assumption_log: array of 4-6 short strings — each a key modelling assumption "
         "with its basis (e.g. 'Revenue growth fades 15%→8% as base scales', 'EBIT margin "
-        "24% vs 22% trailing on operating leverage', 'WACC 12.5% — high ERP for India').\n\n"
+        "24% vs 22% trailing on operating leverage', 'WACC 12.5% — high ERP for India').\n"
+        "- sources: object giving a one-line SOURCE/BASIS for EACH driver (these populate a "
+        "Source column in the Excel model). Keys: growth, ebit_margin, tax_rate, capex_pct, "
+        "da_pct, nwc_pct, wacc, terminal_growth. For growth, the source MUST show the triangulation, "
+        "e.g. 'Blend: 9% co. CAGR / 13% industry / 12% consensus → 11%'. For ebit_margin cite the "
+        "starting (trailing) margin and the expansion/compression logic across the 5 years, "
+        "trailing margin + operating-leverage logic. Others: 'India 10yr 7% + Damodaran ERP', "
+        "'statutory 25%', 'long-run nominal GDP'.\n\n"
         'Example shape: {"thesis":"...","business":"...","bull_case":["..."],'
         '"bear_case":["..."],"catalysts":["..."],"risks":["..."],'
         '"verdict":"ACCUMULATE","verdict_rationale":"Quality franchise, fair value, stagger entries",'
+        '"vs_consensus":"Street targets ₹4,100 (BUY, 22 analysts); we are 8% below on a stiffer 12.5% WACC and slower FY26 growth.",'
+        '"divergence_factor":"We model FY26 EBIT margin ~300bps below consensus on wage inflation.",'
+        '"scenarios":{"bull":{"target":4600,"probability":0.25,"driver":"Margin recovery + faster growth"},'
+        '"base":{"target":3600,"probability":0.5,"driver":"In-line execution"},'
+        '"bear":{"target":2600,"probability":0.25,"driver":"Demand slump, margin compression"}},'
+        '"comps":{"peers":[{"name":"Wipro","ev_ebitda":11,"pe":18},{"name":"HCL Tech","ev_ebitda":13,"pe":22}],'
+        '"median_ev_ebitda":12,"median_pe":20,"implied_value_per_share":3400,"note":"Trades at premium to peers"},'
+        '"sotp":null,'
         '"recommendation":"...",'
         '"price_target":3200,"assumptions":{"growth":[0.09,0.09,0.08,0.08,0.07],'
-        '"ebit_margin":0.25,"tax_rate":0.25,"capex_pct":0.03,"da_pct":0.03,"nwc_pct":0.02,'
+        '"ebit_margin":[0.22,0.23,0.24,0.245,0.25],"tax_rate":0.25,"capex_pct":0.03,"da_pct":0.03,"nwc_pct":0.02,'
         '"wacc":0.12,"terminal_growth":0.045},'
         '"wacc_build":{"rf":0.07,"erp":0.07,"beta":0.9,"cost_of_equity":0.133,'
         '"cost_of_debt":0.06,"equity_weight":0.9,"debt_weight":0.1,"note":"India 10yr + Damodaran ERP"},'
         '"assumption_log":["Revenue growth fades 9%→7% as base scales",'
-        '"EBIT margin 25% on operating leverage","WACC 12% — elevated ERP for India"]}'
+        '"EBIT margin 25% on operating leverage","WACC 12% — elevated ERP for India"],'
+        '"sources":{"growth":"3yr hist avg + guidance","ebit_margin":"trailing margin + op leverage",'
+        '"tax_rate":"India statutory 25%","capex_pct":"3yr capex/revenue","da_pct":"3yr D&A/revenue",'
+        '"nwc_pct":"working-capital trend","wacc":"India 10yr 7% + Damodaran ERP","terminal_growth":"long-run nominal GDP"}}'
     )
     return system, user
 
@@ -1153,11 +2107,35 @@ def _parse_narrative(text: str):
     return None
 
 
-def assemble(d: dict, a: dict, narrative=None, validate=True) -> dict:
+def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") -> dict:
+    recency = data_recency(d)
+    # ── SHORT-TERM: technical note, no DCF ──
+    if horizon == "short":
+        excel = build_excel_short(d, a, narrative)
+        tech = d.get("tech") or {}
+        result = {
+            "symbol": d["symbol"], "name": d["name"], "horizon": "short",
+            "verdict": final_verdict(a, narrative), "quant_verdict": a["verdict"], "action": a["action"],
+            "price": d["price"], "price_target": (narrative or {}).get("price_target"),
+            "data_asof": recency["asof"], "data_status": recency["status"],
+            "authored_by": "Claude + live technicals" if narrative else "Technical engine",
+            "levels": (narrative or {}).get("levels"),
+            "validation": {"ok": bool(tech), "checks": [
+                {"name": "technical indicators computed", "pass": bool(tech),
+                 "detail": f"RSI {tech.get('rsi',0):.0f} · 50/200-DMA present" if tech else "no history"},
+                {"name": "data recency (latest/prev quarter)", "pass": recency["ok"],
+                 "detail": f"{recency['status']} — as-of {recency['asof']}"},
+            ]},
+            "excel": excel, "pdf": build_pdf_short(d, a, narrative),
+        }
+        result["numbers"] = ""
+        result["analysis"], result["speech"] = compose_short(d, a, narrative, result)
+        return result
+
+    # ── LONG-TERM: DCF (default) ──
     asmp = merge_assumptions(default_assumptions(d), (narrative or {}).get("assumptions"))
     excel = build_excel(d, a, narrative, asmp)
     validation = validate_excel(excel, asmp) if validate else None
-    recency = data_recency(d)
     if validation is not None:
         # Python data-recency gate → appended to the checks
         validation["checks"].append({

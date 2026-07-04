@@ -10,7 +10,8 @@ const state = {
   gmailConnected: false,
   voiceEnabled:   true,
   // Continuous listening
-  continuousOn:   false,  // always-on browser recogniser OFF — use Whisper instead (it mis-fired on noise)
+  continuousOn:   true,   // mic always on, listening for the wake word
+  awake:          false,  // true during the 15s command window after "Jarvis"
   isListening:    false,  // recognition currently active
   isHearing:      false,  // user speech detected mid-stream
   isSpeaking:     false,  // TTS currently playing
@@ -83,7 +84,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   initBgCanvas();
   initVizCanvas();
   initVoiceSynth();
-  initSpeechRecognition();
+  initSpeechRecognition();     // always-on continuous listening (original working input)
   setupEventListeners();
   checkUrlFlags();
   checkGmailStatus();
@@ -93,16 +94,17 @@ window.addEventListener('DOMContentLoaded', async () => {
   const bootMsg =
     `${getGreeting()}, Master. J.A.R.V.I.S. is fully operational.\n\n` +
     `All systems online — financial core and voice interface active.\n\n` +
-    `Press the 🌀 Whisper button (or type) to give a command, Sir. Speak any time to interrupt me.`;
+    `Say **"Jarvis"** then your command (e.g. "Jarvis, analysis on Infosys"). ` +
+    `The mic opens for 15 seconds each time, and "Jarvis" also interrupts me.`;
 
   addMessage('jarvis', bootMsg);
 
-  // Voice INPUT is via Whisper (accurate, local). The always-on browser
-  // recogniser is disabled — it mis-fired on ambient noise.
   if (state.voiceEnabled) {
     await sleep(300);
-    speak(`${getGreeting()}, Master. J.A.R.V.I.S. is fully operational. Press Whisper to speak, Sir.`);
+    // NB: greeting must NOT contain the wake word, or it self-triggers.
+    speak(`${getGreeting()}, Master. All systems online and standing by, Sir.`);
   }
+  closeCommandWindow();   // idle: mic on, awaiting the wake word
 });
 
 // ─── Clock ────────────────────────────────────────────────
@@ -136,7 +138,7 @@ function initSpeechRecognition() {
   const rec = new SR();
   rec.continuous      = true;   // ← always-on
   rec.interimResults  = true;
-  rec.lang            = 'en-US';
+  rec.lang            = 'en-IN';   // Indian English — far better for Indian-accented speech
   rec.maxAlternatives = 1;
 
   let interimTimeout = null;
@@ -149,64 +151,95 @@ function initSpeechRecognition() {
         : (interim   += e.results[i][0].transcript);
     }
 
-    // While JARVIS is speaking, ignore recogniser output (it's hearing itself).
-    // Interruption is handled by the echo-cancelled VAD (see startBargeMonitor).
-    if (state.isSpeaking) return;
+    const raw = (finalText || interim);
+    // Accept common mishears of "Jarvis" (cloud STT is unreliable on one short word)
+    const hasWake = WAKE_RE.test(raw);
+    const isFinal = !!finalText.trim();
+    const okLen = s => s.replace(/[^a-z0-9]/gi, '').length >= 2;
 
-    const spoken = finalText || interim;
-    if (spoken.trim()) {
-      messageInput.value = spoken;
-      setMicState('hearing');
+    // Show what the recogniser heard while idle, so mis-hears are visible.
+    if (!state.awake && !state.isSpeaking && raw.trim()) {
+      setVoiceStatus('heard: ' + raw.trim().slice(0, 40));
     }
 
-    // Clear pending interim timeout
-    clearTimeout(interimTimeout);
+    // ── While JARVIS is speaking: only "Jarvis" interrupts (and wakes the mic) ──
+    if (state.isSpeaking) {
+      if (hasWake) {
+        speechSynthesis.cancel();
+        state.isSpeaking = false;
+        sidebar.classList.remove('speaking');
+        arcReactor?.classList.remove('speaking');
+        openCommandWindow();
+        const cmd = stripWake(raw);
+        if (isFinal && okLen(cmd)) { sendMessage(cmd); closeCommandWindow(); }
+      }
+      return;
+    }
 
-    if (finalText.trim()) {
-      // Final result → send immediately
+    // ── Not awake: ignore ALL audio until the wake word "Jarvis" ──
+    if (!state.awake) {
+      if (hasWake) {
+        openCommandWindow();
+        const cmd = stripWake(raw);
+        if (isFinal && okLen(cmd)) { sendMessage(cmd); closeCommandWindow(); }   // "Jarvis, analyse Infosys"
+      }
+      return;   // ambient noise / "good morning" → ignored
+    }
+
+    // ── Awake (15-second window): capture the command ──
+    clearTimeout(interimTimeout);
+    const cmd = stripWake(raw).trim();
+    if (cmd) { messageInput.value = cmd; setMicState('hearing'); }
+    if (isFinal && okLen(cmd)) {
       messageInput.value = '';
-      setMicState('continuous');
-      sendMessage(finalText.trim());
+      sendMessage(cmd);
+      closeCommandWindow();
     } else {
-      // Still interim → show for 3s then auto-submit if nothing more comes
       interimTimeout = setTimeout(() => {
-        const val = messageInput.value.trim();
-        if (val && !state.isSpeaking) {
-          messageInput.value = '';
-          setMicState('continuous');
-          sendMessage(val);
-        }
-      }, 3000);
+        const val = stripWake(messageInput.value).trim();
+        if (val && okLen(val) && state.awake) { messageInput.value = ''; sendMessage(val); closeCommandWindow(); }
+      }, 2500);
     }
   };
 
   rec.onerror = e => {
-    if (e.error === 'no-speech') {
-      // Normal silence — just restart
-    } else if (e.error === 'aborted') {
-      // We stopped it intentionally — don't restart
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      setVoiceStatus('MIC BLOCKED — allow microphone access');
+      state.continuousOn = false;   // can't recover without permission
       return;
-    } else {
-      setVoiceStatus('ERR: ' + e.error);
     }
-    if (state.continuousOn) scheduleRestart();   // stay alive even while speaking (barge-in)
+    if (e.error === 'aborted') return;   // intentional stop
+    // no-speech / network / audio-capture → just keep restarting
+    if (state.continuousOn) scheduleRestart(300);
   };
 
   rec.onend = () => {
     state.isListening = false;
-    if (state.continuousOn) scheduleRestart();   // keep mic live during TTS for barge-in
+    state.lastRecEnd = Date.now();
+    if (state.continuousOn) scheduleRestart(150);   // near-instant restart → minimal listening gap
     else updateMicUI();
   };
 
   rec.onstart = () => {
     state.isListening = true;
-    setMicState('continuous');
-    setVoiceStatus('LISTENING');
+    state.lastRecActivity = Date.now();
+    if (state.awake) { setMicState('hearing'); setVoiceStatus('LISTENING — speak your command'); }
+    else { setMicState('continuous'); setVoiceStatus('AWAITING WAKE WORD — say “Jarvis”'); }
   };
 
   state.recognition = rec;
-  // Auto-start
   if (state.continuousOn) scheduleRestart(200);
+
+  // ── Watchdog: keep the mic ALWAYS on. If the recogniser silently dies
+  //    (network blip, Chrome's ~60s cap), force it back to life.
+  if (!state._micWatchdog) {
+    state._micWatchdog = setInterval(() => {
+      if (state.continuousOn && !state.isListening && !state.isSpeaking) {
+        try { state.recognition.start(); }
+        catch (_) { scheduleRestart(200); }
+      }
+    }, 2500);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -264,6 +297,40 @@ async function sendToWhisper(blob) {
   } catch (e) {
     setVoiceStatus('STT FAIL');
   }
+}
+
+// ═══ Wake word "Jarvis" → open a 15-second command window ═══
+let awakeTimer = null;
+const WAKE_WINDOW_MS = 15000;
+
+// Cloud STT mangles one short word — accept close phonetic variants of "Jarvis".
+const WAKE_RE = /\b(jarvis|jarvi|jarves|jarvez|jarvix|jervis|jervis|jarwis|jaravis|jharvis|garvis|gervais|jarbis|charvis|travis)\b/i;
+
+function stripWake(t) {
+  return (t || '').replace(new RegExp(WAKE_RE.source, 'gi'), ' ')
+                  .replace(/^[\s,.:;!-]+/, '').replace(/\s{2,}/g, ' ').trim();
+}
+
+function openCommandWindow() {
+  state.awake = true;
+  clearTimeout(awakeTimer);
+  awakeTimer = setTimeout(closeCommandWindow, WAKE_WINDOW_MS);
+  setMicState('hearing');
+  voicePill.textContent = '● LISTENING (15s)';
+  voicePill.className = 'status-pill gmail-on';
+  setVoiceStatus('LISTENING — speak your command');
+  arcReactor?.classList.add('listening');
+}
+
+function closeCommandWindow() {
+  state.awake = false;
+  clearTimeout(awakeTimer);
+  messageInput.value = '';
+  setMicState('continuous');
+  voicePill.textContent = '● SAY “JARVIS”';
+  voicePill.className = 'status-pill';
+  setVoiceStatus('AWAITING WAKE WORD');
+  arcReactor?.classList.remove('listening');
 }
 
 let restartTimeout = null;
@@ -357,10 +424,22 @@ function initVoiceSynth() {
   load();
 }
 
-// ═══ Barge-in: echo-cancelled mic VAD — detects YOUR voice (not JARVIS's) ═══
-let vadStream = null, vadAnalyser = null, vadData = null, vadRAF = null;
+// ═══════════════════════════════════════════════════════════
+//  PUSH-TO-TALK — mic records ONLY when you press it, then
+//  auto-sends when you stop talking. It never listens on its own,
+//  so ambient noise can't become a command. Whisper = accurate STT.
+// ═══════════════════════════════════════════════════════════
+let vadStream = null, vadAnalyser = null, vadData = null;
+let autoVoiceOn = false;                 // true while actively recording (push-to-talk)
+let pttRAF = null, pttHadSpeech = false, pttSilenceMs = 0, pttLastTs = 0, pttStartTs = 0;
+let avRecorder = null, avChunks = [];
+let bargeRAF = null;
 
-async function ensureVAD() {
+const AV_ON = 0.05;              // speech-level threshold (RMS)
+const PTT_END_SILENCE = 1200;   // stop after this much trailing silence
+const PTT_MAX_MS = 15000;       // hard cap on one utterance
+
+async function initAutoVoice() {
   if (vadAnalyser) return true;
   try {
     vadStream = await navigator.mediaDevices.getUserMedia({
@@ -376,39 +455,112 @@ async function ensureVAD() {
   } catch (e) { return false; }
 }
 
-function startBargeMonitor() {
-  if (!vadAnalyser) return;
+function avRms() {
+  vadAnalyser.getByteTimeDomainData(vadData);
+  let s = 0;
+  for (let i = 0; i < vadData.length; i++) { const v = (vadData[i] - 128) / 128; s += v * v; }
+  return Math.sqrt(s / vadData.length);
+}
+
+// Press to talk (start recording). Pressing while JARVIS speaks also stops it.
+async function startAutoVoice() {
+  if (autoVoiceOn) return;
+  if (!(await initAutoVoice())) { setVoiceStatus('MIC ERROR'); return; }
+  if (state.isSpeaking) speechSynthesis.cancel();      // pressing to talk cuts off JARVIS
+  autoVoiceOn = true;
+  pttHadSpeech = false; pttSilenceMs = 0; pttLastTs = 0; pttStartTs = performance.now();
+  avChunks = [];
+  try {
+    avRecorder = new MediaRecorder(vadStream);
+    avRecorder.ondataavailable = e => { if (e.data.size) avChunks.push(e.data); };
+    avRecorder.onstop = pttFinish;
+    avRecorder.start();
+  } catch (e) { autoVoiceOn = false; setVoiceStatus('MIC ERROR'); return; }
+  setMicState('hearing');
+  arcReactor?.classList.add('listening');
+  voicePill.textContent = '● RECORDING';
+  voicePill.className = 'status-pill gmail-on';
+  setVoiceStatus('RECORDING — speak, pause to send');
+  pttLoop();
+}
+
+function pttLoop() {
+  if (!autoVoiceOn) return;
+  const now = performance.now();
+  const dt = pttLastTs ? now - pttLastTs : 16;
+  pttLastTs = now;
+  const level = avRms();
+  if (level > AV_ON) { pttHadSpeech = true; pttSilenceMs = 0; }
+  else if (pttHadSpeech) { pttSilenceMs += dt; }
+  // auto-stop: had speech then trailing silence, or hit the hard cap
+  if ((pttHadSpeech && pttSilenceMs > PTT_END_SILENCE) || (now - pttStartTs) > PTT_MAX_MS) {
+    stopAutoVoice();
+    return;
+  }
+  pttRAF = requestAnimationFrame(pttLoop);
+}
+
+function stopAutoVoice() {
+  if (!autoVoiceOn) return;
+  autoVoiceOn = false;
+  if (pttRAF) cancelAnimationFrame(pttRAF);
+  arcReactor?.classList.remove('listening');
+  setMicState('off');
+  voicePill.textContent = '🎙 PUSH TO TALK';
+  voicePill.className = 'status-pill';
+  if (avRecorder && avRecorder.state !== 'inactive') avRecorder.stop();   // → pttFinish
+}
+
+async function pttFinish() {
+  const blob = new Blob(avChunks, { type: avRecorder.mimeType || 'audio/webm' });
+  if (!pttHadSpeech || blob.size < 2400) { setVoiceStatus('STANDBY'); return; }  // nothing said
+  setVoiceStatus('TRANSCRIBING…');
+  try {
+    const fd = new FormData();
+    fd.append('audio', blob, 'clip.webm');
+    const res = await fetch('/api/transcribe', { method: 'POST', body: fd });
+    const data = await res.json();
+    const text = (data.text || '').trim();
+    if (text.replace(/[^a-z0-9]/gi, '').length >= 2) sendMessage(text);
+    else setVoiceStatus('NO SPEECH');
+  } catch (e) {
+    setVoiceStatus('STT FAIL');
+  }
+}
+
+// Barge-in DURING TTS only: cancel-only (never records/commands), strict + echo-cancelled.
+async function startBargeMonitor() {
+  if (!(await initAutoVoice())) return;
   let loud = 0;
+  // Warm up so the echo canceller locks onto JARVIS's output first, and use a HIGH
+  // threshold so JARVIS's own leaked voice never self-cancels — only your clear speech does.
+  const startAt = performance.now() + 500;
   const check = () => {
-    if (!state.isSpeaking) { vadRAF = null; return; }
-    vadAnalyser.getByteTimeDomainData(vadData);
-    let sum = 0;
-    for (let i = 0; i < vadData.length; i++) { const v = (vadData[i] - 128) / 128; sum += v * v; }
-    const rms = Math.sqrt(sum / vadData.length);       // echo-cancelled → only user's voice
-    loud = rms > 0.055 ? loud + 1 : 0;
-    if (loud >= 3) {                                    // ~sustained speech → interrupt
-      speechSynthesis.cancel();                         // triggers utt.onend cleanup
-      vadRAF = null;
-      return;
+    if (!state.isSpeaking) { bargeRAF = null; return; }
+    if (performance.now() >= startAt) {
+      if (avRms() > 0.12) { loud++; } else { loud = 0; }    // clear, close user voice only
+      if (loud >= 8) {                                       // ~130ms sustained → stop
+        speechSynthesis.cancel();
+        state.isSpeaking = false;
+        sidebar.classList.remove('speaking');
+        arcReactor?.classList.remove('speaking');
+        bargeRAF = null;
+        return;
+      }
     }
-    vadRAF = requestAnimationFrame(check);
+    bargeRAF = requestAnimationFrame(check);
   };
-  vadRAF = requestAnimationFrame(check);
+  bargeRAF = requestAnimationFrame(check);
 }
 
 function speak(text) {
   if (!state.voiceEnabled || !text) {
-    // Still log to sidebar even if audio off
     logToSidebar(text);
-    if (state.continuousOn) scheduleRestart(300);
     return;
   }
 
   speechSynthesis.cancel();
   logToSidebar(text);
-
-  // Pause mic while speaking
-  pauseListeningForSpeech();
 
   const clean = text
     .replace(/J\.A\.R\.V\.I\.S\./g, 'Jarvis')
@@ -430,16 +582,17 @@ function speak(text) {
     state.isSpeaking = true;
     sidebar.classList.add('speaking');
     arcReactor?.classList.add('speaking');   // reactor flares while JARVIS talks
-    ensureVAD().then(ok => { if (ok) startBargeMonitor(); });  // listen for interruption
+    // Say "Jarvis" to interrupt — handled by the recogniser in onresult.
   };
 
   utt.onend = utt.onerror = () => {
     state.isSpeaking = false;
     sidebar.classList.remove('speaking');
     arcReactor?.classList.remove('speaking');
-    // Mark typewriter done → hide cursor
     if (sbCursor) sbCursor.classList.add('done');
-    resumeListeningAfterSpeech();
+    // Resume continuous listening
+    if (state.continuousOn) scheduleRestart(500);
+    setVoiceStatus(state.continuousOn ? 'LISTENING' : 'STANDBY');
   };
 
   speechSynthesis.speak(utt);
@@ -660,11 +813,10 @@ async function sendMessage(text) {
   showThinking(true);
   ttsReset();
 
-  // Analysis request → do everything automatically, ask nothing
-  if (looksLikeAnalysis(text)) {
-    const handled = await runChatAnalysis(text);
-    if (handled) return;
-  }
+  // ALWAYS try the data pipeline first — any company mention gets the full
+  // numbers / DCF / PDF / Excel. Only genuine non-stock chat falls through.
+  const handled = await runChatAnalysis(text);
+  if (handled) return;
 
   const actualModel = autoRouteModel(text);
   const t0 = Date.now();
@@ -1097,11 +1249,13 @@ function setupEventListeners() {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(messageInput.value); }
   });
 
-  // Both mic buttons use Whisper (accurate, local) — no flaky always-on recogniser
-  micBtn.addEventListener('click', toggleWhisper);
-
-  // Whisper Flow — push-to-talk record → local transcription
-  whisperBtn.addEventListener('click', toggleWhisper);
+  // Both mic buttons toggle always-on continuous listening
+  micBtn.addEventListener('click', () => {
+    state.continuousOn ? stopContinuousListening() : startContinuousListening();
+  });
+  whisperBtn.addEventListener('click', () => {
+    state.continuousOn ? stopContinuousListening() : startContinuousListening();
+  });
 
   // Voice output toggle
   voiceToggleBtn.addEventListener('click', () => {

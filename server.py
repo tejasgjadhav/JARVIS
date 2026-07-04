@@ -65,13 +65,13 @@ RESPONSE STYLE:
 - Highlight critical action items
 - End analyses with a clear "Bottom Line" or recommendation
 
-STOCK / LONG-TERM STRATEGY REQUESTS (IMPORTANT):
-- When Master asks for a long-term strategy, view, or analysis on a specific stock or company,
-  keep the CHAT reply to exactly TWO lines:
-    Line 1 — a one-sentence intro of the company (what it does / sector).
-    Line 2 — your clear recommendation (e.g. "Recommendation: Accumulate on dips — long-term BUY").
-- Do NOT dump the full analysis in chat; the detailed model is delivered separately as an Excel + PDF report.
-- Never invent precise financial figures you do not actually have; if numbers are unknown, say so plainly.
+STOCK ANALYSIS ROUTING (IMPORTANT):
+- A specific stock request (valuation, price target, buy/sell) is normally handled by a separate
+  LIVE-DATA pipeline. If a stock request has reached YOU here, it means the ticker could NOT be
+  identified — so ask the Master to name the company clearly, e.g. "Which company, Master? Say
+  'analyse Infosys' or 'valuation of Tata Motors'." Keep it to one short line.
+- DO NOT claim you lack live data, DO NOT invent numbers, and DO NOT promise to build a report.
+- This chat mode is for general finance questions, concepts, and follow-ups only.
 
 Current date/time: {now}"""
 
@@ -127,14 +127,22 @@ def transcribe():
 # ─── Equity Report — real data, no LLM ─────────────────────
 _report_cache = {}
 
-def _claude_narrative(d, a):
-    """Ask Claude to author the institutional narrative from REAL figures.
+def _detect_horizon(message):
+    """Short-term (6-12mo technical) vs long-term (DCF)."""
+    m = (message or '').lower()
+    if re.search(r'\b(short.?term|short term|6.?month|six month|near.?term|swing|trade|trading|'
+                 r'technical|momentum|entry|breakout|stop.?loss|next (6|six|twelve|12) month)\b', m):
+        return 'short'
+    return 'long'
+
+def _claude_narrative(d, a, horizon='long'):
+    """Ask Claude to author the narrative from REAL figures.
     Returns a narrative dict, or None if the API is unavailable / errors."""
     import report_engine as R
     if not client:
         return None
     try:
-        system, user = R.build_prompt(d, a)
+        system, user = (R.build_prompt_short(d, a) if horizon == 'short' else R.build_prompt(d, a))
         res = client.messages.create(
             model=REPORT_MODEL,
             max_tokens=4096,
@@ -145,36 +153,42 @@ def _claude_narrative(d, a):
     except Exception:
         return None  # graceful fallback → deterministic report
 
+_EXTRACT_SYS = (
+    "The user is an equity investor. Identify the Indian-listed company they refer "
+    "to — even if named casually, as a brand, or as a single word that doubles as a "
+    "common word. Assume ANY company mention is the STOCK. Reply on ONE line exactly: "
+    "SYMBOL=<NSE ticker or NONE> | NAME=<official company name or NONE>. "
+    "Examples: Infosys→SYMBOL=INFY|NAME=Infosys; 'eternal' or 'zomato'→SYMBOL=ETERNAL|NAME=Eternal "
+    "Limited (formerly Zomato); 'reliance'→SYMBOL=RELIANCE|NAME=Reliance Industries; "
+    "'tata motors'→SYMBOL=TMPV|NAME=Tata Motors. Only output NONE if there is genuinely "
+    "no company reference. Nothing else."
+)
+
 def _extract_stock(message):
-    """Cheap Haiku call → (ticker, company_name). Company name is used to
-    recover from renamed/delisted tickers via live search."""
+    """(ticker, company_name). Tries Sonnet, then falls back to Haiku so a
+    transient API hiccup never silently drops a stock query."""
     if not client:
         return (None, None)
-    try:
-        res = client.messages.create(
-            model=EXTRACT_MODEL, max_tokens=40,
-            system=("The user is an equity investor. Identify the Indian-listed company they refer "
-                    "to — even if named casually, as a brand, or as a single word that doubles as a "
-                    "common word. Assume ANY company mention is the STOCK. Reply on ONE line exactly: "
-                    "SYMBOL=<NSE ticker or NONE> | NAME=<official company name or NONE>. "
-                    "Examples: Infosys→SYMBOL=INFY|NAME=Infosys; 'buy eternal'→SYMBOL=ETERNAL|NAME=Eternal "
-                    "Limited (formerly Zomato); 'reliance'→SYMBOL=RELIANCE|NAME=Reliance Industries; "
-                    "'tata motors'→SYMBOL=TMPV|NAME=Tata Motors. Only output NONE if there is genuinely "
-                    "no company reference. Nothing else."),
-            messages=[{'role': 'user', 'content': message}],
-        )
-        raw = res.content[0].text or ''
-        m_sym = re.search(r'SYMBOL=\s*([A-Za-z0-9.&-]+)', raw)
-        m_name = re.search(r'NAME=\s*(.+)', raw)
-        sym = m_sym.group(1).strip().upper() if m_sym else None
-        if not sym or sym == 'NONE' or len(sym) > 14:
-            sym = None
-        name = m_name.group(1).strip() if m_name else None
-        if name and name.upper() == 'NONE':
-            name = None
-        return (sym, name)
-    except Exception:
-        return (None, None)
+    for model in (EXTRACT_MODEL, CHAT_MODEL):   # capable model, then cheap fallback
+        try:
+            res = client.messages.create(
+                model=model, max_tokens=40, system=_EXTRACT_SYS,
+                messages=[{'role': 'user', 'content': message}],
+            )
+            raw = res.content[0].text or ''
+            m_sym = re.search(r'SYMBOL=\s*([A-Za-z0-9.&-]+)', raw)
+            m_name = re.search(r'NAME=\s*(.+)', raw)
+            sym = m_sym.group(1).strip().upper() if m_sym else None
+            if not sym or sym == 'NONE' or len(sym) > 14:
+                sym = None
+            name = m_name.group(1).strip() if m_name else None
+            if name and name.upper() == 'NONE':
+                name = None
+            if sym or name:
+                return (sym, name)
+        except Exception:
+            continue   # try the next model
+    return (None, None)
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze_chat():
@@ -187,6 +201,7 @@ def analyze_chat():
     sym, name = _extract_stock(message)
     if not sym and not name:
         return jsonify({'is_analysis': False})
+    sym = R.apply_alias(sym)                 # map known renames (Zomato→Eternal, etc.)
     note = None
     d = a = None
     # 1) try the extracted ticker
@@ -208,13 +223,15 @@ def analyze_chat():
                 note = f"‘{sym or name}’ resolved to {d['name']} ({alt}) via live search."
         except Exception as ex:
             return jsonify({'is_analysis': True, 'error': str(ex)})
-    narrative = _claude_narrative(d, a)
-    r = R.assemble(d, a, narrative)
+    horizon = _detect_horizon(message)
+    narrative = _claude_narrative(d, a, horizon)
+    r = R.assemble(d, a, narrative, horizon=horizon)
     _report_cache[r['symbol']] = r
     val = r.get('validation') or {}
     return jsonify({
         'is_analysis': True,
         'symbol': r['symbol'], 'name': r['name'],
+        'horizon': horizon,
         'note': note,                 # resolution note (renamed/demerged tickers)
         'analysis': r['analysis'],    # ENTIRE Claude analysis — shown in chat
         'speech': r['speech'],        # first 2 + last 2 lines — spoken

@@ -245,12 +245,18 @@ body{font-family:var(--fbody);color:var(--text);-webkit-font-smoothing:antialias
 .left-panel,.right-panel{display:none !important}
 .center-hub{max-width:920px;margin:0 auto;width:100%}
 
-/* Arc-reactor reactive states — movie-JARVIS feel */
-.arc-reactor{transition:filter .3s ease, transform .3s ease}
-.arc-reactor.listening{filter:drop-shadow(0 0 14px var(--arc)) drop-shadow(0 0 30px rgba(0,212,255,.5))}
-.arc-reactor.listening .ring-outer{animation-duration:3s !important}
-.arc-reactor.listening .ring-mid{animation-duration:2s !important}
-.arc-reactor.speaking{filter:drop-shadow(0 0 18px var(--gold)) drop-shadow(0 0 42px rgba(255,193,7,.55));transform:scale(1.04)}
-.arc-reactor.speaking .arc-core-inner{background:radial-gradient(circle,var(--gold),var(--warn))!important;box-shadow:0 0 26px var(--gold)!important}
-.arc-reactor.speaking .ring-outer,.arc-reactor.speaking .ring-mid,.arc-reactor.speaking .ring-inner{border-color:var(--gold)!important;animation-duration:1.1s !important}
-.arc-reactor.speaking .arc-triangle{border-bottom-color:#1a1000 !important}
+/* ── SVG Arc Reactor ── */
+.arc-reactor{position:relative;width:150px;height:150px;flex-shrink:0;margin-bottom:6px;transition:filter .35s ease, transform .35s ease}
+.reactor{width:100%;height:100%;overflow:visible;display:block}
+.re-core{animation:reCorePulse 2.4s ease-in-out infinite;transform-box:fill-box;transform-origin:center}
+.re-tri{animation:reTriPulse 2.4s ease-in-out infinite}
+@keyframes reCorePulse{0%,100%{opacity:.9;transform:scale(1)}50%{opacity:1;transform:scale(1.06)}}
+@keyframes reTriPulse{0%,100%{opacity:.75}50%{opacity:1}}
+.arc-reactor{filter:drop-shadow(0 0 10px rgba(0,212,255,.35))}
+
+/* reactive states */
+.arc-reactor.listening{filter:drop-shadow(0 0 16px var(--arc)) drop-shadow(0 0 34px rgba(0,212,255,.55))}
+.arc-reactor.speaking{transform:scale(1.05);filter:drop-shadow(0 0 20px var(--gold)) drop-shadow(0 0 46px rgba(255,193,7,.5))}
+.arc-reactor.speaking .re-coils{stroke:var(--gold)!important}
+.arc-reactor.speaking .re-core{filter:url(#reGlow) saturate(1.6) hue-rotate(-32deg)}
+.arc-reactor.speaking .re-tri{stroke:#241500!important}

@@ -92,16 +92,49 @@
       <!-- CENTER: Arc Reactor + Chat -->
       <section class="center-hub">
 
-        <!-- Arc Reactor -->
+        <!-- Arc Reactor (original SVG — Iron Man Mark reactor) -->
         <div class="arc-reactor" id="arcReactor">
-          <div class="arc-ring ring-outer"></div>
-          <div class="arc-ring ring-mid"></div>
-          <div class="arc-ring ring-inner"></div>
-          <div class="arc-core">
-            <div class="arc-core-inner">
-              <div class="arc-triangle"></div>
-            </div>
-          </div>
+          <svg class="reactor" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <radialGradient id="coreGrad" cx="50%" cy="45%" r="55%">
+                <stop offset="0%"  stop-color="#f2ffff"/>
+                <stop offset="30%" stop-color="#6fe4ff"/>
+                <stop offset="68%" stop-color="#0aa6e0"/>
+                <stop offset="100%" stop-color="#021c30"/>
+              </radialGradient>
+              <filter id="reGlow" x="-60%" y="-60%" width="220%" height="220%">
+                <feGaussianBlur stdDeviation="2.6" result="b"/>
+                <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+            </defs>
+
+            <!-- outer ticked ring -->
+            <circle cx="100" cy="100" r="95" fill="none" stroke="rgba(0,212,255,.45)" stroke-width="2" stroke-dasharray="1.5 7">
+              <animateTransform attributeName="transform" type="rotate" from="0 100 100" to="360 100 100" dur="26s" repeatCount="indefinite"/>
+            </circle>
+            <!-- technical ring -->
+            <circle cx="100" cy="100" r="84" fill="none" stroke="rgba(0,180,230,.30)" stroke-width="1" stroke-dasharray="16 10">
+              <animateTransform attributeName="transform" type="rotate" from="360 100 100" to="0 100 100" dur="18s" repeatCount="indefinite"/>
+            </circle>
+            <!-- coil frame rings -->
+            <circle cx="100" cy="100" r="76" fill="none" stroke="rgba(0,150,210,.5)" stroke-width="1.5"/>
+            <circle cx="100" cy="100" r="52" fill="none" stroke="rgba(0,150,210,.5)" stroke-width="1.5"/>
+            <!-- signature coil ring -->
+            <circle class="re-coils" cx="100" cy="100" r="64" fill="none" stroke="url(#coreGrad)" stroke-width="20"
+                    stroke-dasharray="3.6 9.9" opacity=".9" filter="url(#reGlow)">
+              <animateTransform attributeName="transform" type="rotate" from="0 100 100" to="360 100 100" dur="7s" repeatCount="indefinite"/>
+            </circle>
+            <!-- rotating scanner sweep -->
+            <path d="M100 100 L100 24 A76 76 0 0 1 154 46 Z" fill="rgba(120,235,255,.12)">
+              <animateTransform attributeName="transform" type="rotate" from="0 100 100" to="360 100 100" dur="3.4s" repeatCount="indefinite"/>
+            </path>
+            <!-- inner bezel -->
+            <circle cx="100" cy="100" r="40" fill="rgba(0,10,24,.7)" stroke="rgba(0,212,255,.7)" stroke-width="2"/>
+            <!-- glowing core -->
+            <circle class="re-core" cx="100" cy="100" r="30" fill="url(#coreGrad)" filter="url(#reGlow)"/>
+            <!-- Mark triangle -->
+            <polygon class="re-tri" points="100,83 115,109 85,109" fill="none" stroke="#f2ffff" stroke-width="2.5" stroke-linejoin="round" opacity=".92"/>
+          </svg>
           <!-- Corner HUD decorators -->
           <div class="hud-corner tl"></div>
           <div class="hud-corner tr"></div>
