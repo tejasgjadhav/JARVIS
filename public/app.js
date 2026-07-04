@@ -165,10 +165,7 @@ function initSpeechRecognition() {
     // ── While JARVIS is speaking: only "Jarvis" interrupts (and wakes the mic) ──
     if (state.isSpeaking) {
       if (hasWake) {
-        speechSynthesis.cancel();
-        state.isSpeaking = false;
-        sidebar.classList.remove('speaking');
-        arcReactor?.classList.remove('speaking');
+        ttsAbort();   // cancel current utterance AND flush the queued sentences
         openCommandWindow();
         const cmd = stripWake(raw);
         if (isFinal && okLen(cmd)) { sendMessage(cmd); closeCommandWindow(); }
@@ -231,12 +228,25 @@ function initSpeechRecognition() {
   if (state.continuousOn) scheduleRestart(200);
 
   // ── Watchdog: keep the mic ALWAYS on. If the recogniser silently dies
-  //    (network blip, Chrome's ~60s cap), force it back to life.
+  //    (network blip, Chrome's ~60s cap), force it back to life — even while
+  //    JARVIS is speaking, so the "Jarvis" interrupt can always be heard.
   if (!state._micWatchdog) {
     state._micWatchdog = setInterval(() => {
-      if (state.continuousOn && !state.isListening && !state.isSpeaking) {
+      if (state.continuousOn && !state.isListening) {
         try { state.recognition.start(); }
         catch (_) { scheduleRestart(200); }
+      }
+      // Failsafe: if isSpeaking is stuck true but nothing is actually playing
+      // (Chrome froze the utterance and never fired onend), reset speech state.
+      if (state.isSpeaking && !speechSynthesis.speaking && !speechSynthesis.pending) {
+        state._stuckSpeech = (state._stuckSpeech || 0) + 1;
+        if (state._stuckSpeech >= 2) {   // ~5s of phantom "speaking"
+          ttsAbort();
+          state._stuckSpeech = 0;
+          setVoiceStatus('AWAITING WAKE WORD — say “Jarvis”');
+        }
+      } else {
+        state._stuckSpeech = 0;
       }
     }, 2500);
   }
@@ -372,7 +382,7 @@ function pauseListeningForSpeech() {
 function resumeListeningAfterSpeech() {
   if (!state.continuousOn) return;
   setMicState('continuous');
-  setVoiceStatus('LISTENING');
+  setVoiceStatus(state.awake ? 'LISTENING — speak your command' : 'AWAITING WAKE WORD — say “Jarvis”');
   scheduleRestart(700); // slight pause after speech ends
 }
 
@@ -559,6 +569,9 @@ function speak(text) {
     return;
   }
 
+  // Flush any streamed-reply queue BEFORE cancelling, or the cancelled
+  // utterance's onend drains the old queue over this new speech.
+  tts.q = []; tts.buf = ''; tts.done = true; tts.active = false;
   speechSynthesis.cancel();
   logToSidebar(text);
 
@@ -582,17 +595,19 @@ function speak(text) {
     state.isSpeaking = true;
     sidebar.classList.add('speaking');
     arcReactor?.classList.add('speaking');   // reactor flares while JARVIS talks
+    startSpeakKeepalive();                    // Chrome long-utterance freeze workaround
     // Say "Jarvis" to interrupt — handled by the recogniser in onresult.
   };
 
   utt.onend = utt.onerror = () => {
+    stopSpeakKeepalive();
     state.isSpeaking = false;
     sidebar.classList.remove('speaking');
     arcReactor?.classList.remove('speaking');
     if (sbCursor) sbCursor.classList.add('done');
-    // Resume continuous listening
+    // Resume continuous listening in wake-word mode
     if (state.continuousOn) scheduleRestart(500);
-    setVoiceStatus(state.continuousOn ? 'LISTENING' : 'STANDBY');
+    setVoiceStatus(state.continuousOn ? 'AWAITING WAKE WORD — say “Jarvis”' : 'STANDBY');
   };
 
   speechSynthesis.speak(utt);
@@ -683,6 +698,34 @@ function ttsReset() {
   tts.buf=''; tts.q=[]; tts.active=false; tts.done=false; tts.full='';
 }
 
+// Hard-stop ALL speech: cancel the current utterance AND flush queued sentences.
+// Without the flush, the cancelled utterance's onend fires _ttsDrain() and JARVIS
+// resumes talking right after being interrupted.
+function ttsAbort() {
+  tts.q = []; tts.buf = ''; tts.done = true; tts.active = false;
+  speechSynthesis.cancel();
+  stopSpeakKeepalive();
+  state.isSpeaking = false;
+  sidebar.classList.remove('speaking');
+  arcReactor?.classList.remove('speaking');
+  if (sbCursor) sbCursor.classList.add('done');
+}
+
+// ── Chrome long-utterance fix ──
+// Chrome's speechSynthesis silently freezes ~15s into a long utterance and never
+// fires onend (the classic "JARVIS stopped reading" bug). Periodic resume() keeps
+// it alive; the watchdog below clears any stuck isSpeaking state.
+let speakKeepalive = null;
+function startSpeakKeepalive() {
+  stopSpeakKeepalive();
+  speakKeepalive = setInterval(() => {
+    if (speechSynthesis.speaking) { speechSynthesis.pause(); speechSynthesis.resume(); }
+  }, 10000);
+}
+function stopSpeakKeepalive() {
+  if (speakKeepalive) { clearInterval(speakKeepalive); speakKeepalive = null; }
+}
+
 function ttsFeed(chunk) {
   tts.full += chunk;
   if (!state.voiceEnabled) return;
@@ -721,9 +764,11 @@ function ttsFinish() {
 
 function _ttsDrain() {
   if (tts.active || !tts.q.length) return;
+  if (!state.voiceEnabled) { tts.q = []; return; }   // muted mid-stream → drop queue
   if (!state.isSpeaking) pauseListeningForSpeech();
   const sentence = tts.q.shift();
   tts.active = true; state.isSpeaking = true;
+  startSpeakKeepalive();                    // Chrome long-utterance freeze workaround
   sidebar.classList.add('speaking');
   if (!state.sidebarOpen) openSidebar();
   sbNow.style.display = 'block';
@@ -736,6 +781,7 @@ function _ttsDrain() {
     tts.active = false;
     if (tts.q.length) { _ttsDrain(); return; }
     if (tts.done) {
+      stopSpeakKeepalive();
       state.isSpeaking = false;
       sidebar.classList.remove('speaking');
       sbNow.style.display = 'none';
@@ -1262,7 +1308,7 @@ function setupEventListeners() {
     state.voiceEnabled = !state.voiceEnabled;
     voiceToggleBtn.textContent = state.voiceEnabled ? '🔊' : '🔇';
     voiceToggleBtn.classList.toggle('active', !state.voiceEnabled);
-    if (!state.voiceEnabled) { speechSynthesis.cancel(); state.isSpeaking=false; sidebar.classList.remove('speaking'); resumeListeningAfterSpeech(); }
+    if (!state.voiceEnabled) { ttsAbort(); resumeListeningAfterSpeech(); }   // flush queue too, not just current utterance
   });
 
   // Audio log sidebar toggle
