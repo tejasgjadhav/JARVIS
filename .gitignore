@@ -1,5 +1,6 @@
 # Secrets — NEVER commit
-.env
+# .env is TRACKED with a masked key (xx); real key protected via skip-worktree
+.env.real.bak
 *.key
 
 # Chrome app-window profile (170MB of runtime junk)
