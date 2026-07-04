@@ -1,0 +1,23 @@
+# Secrets — NEVER commit
+.env
+*.key
+
+# Chrome app-window profile (170MB of runtime junk)
+.chrome-app-profile/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.log
+
+# Generated report outputs (created at runtime)
+/tmp/
+reports/
+*.xlsx
+*.pdf

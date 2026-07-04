@@ -1,0 +1,21 @@
+# Core
+flask
+anthropic
+python-dotenv
+
+# Market data & modelling
+yfinance
+pandas
+openpyxl
+reportlab
+
+# Excel formula validation (optional heavy check)
+formulas
+
+# Voice (local speech-to-text)
+faster-whisper
+
+# Optional — Gmail integration
+google-auth
+google-auth-oauthlib
+google-api-python-client

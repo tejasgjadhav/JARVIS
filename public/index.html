@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>J.A.R.V.I.S. — Mark VII</title>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Rajdhani:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <canvas id="bgCanvas"></canvas>
+
+  <div class="jarvis-app">
+
+    <!-- ═══ HEADER ═══ -->
+    <header class="hud-header">
+      <div class="header-left">
+        <div class="logo-block">
+          <div class="logo-arc"></div>
+          <span class="logo-text">J.A.R.V.I.S.</span>
+          <span class="logo-sub">MARK VII</span>
+        </div>
+        <div class="status-row">
+          <span class="status-pill online" id="systemStatus">● ONLINE</span>
+          <span class="status-pill" id="gmailPill">● GMAIL OFF</span>
+          <span class="status-pill" id="voicePill">🎙 VOICE READY</span>
+        </div>
+      </div>
+
+      <div class="header-center">
+        <div class="clock-block">
+          <div class="clock" id="clock">--:--:--</div>
+          <div class="date" id="dateDisplay">Loading...</div>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="god-mode-block">
+          <div class="god-mode-label">⚡ GOD MODE</div>
+          <select id="modelSelector" class="model-select">
+            <option value="auto" selected>⚡ AUTO — SMART ROUTE</option>
+            <option value="claude-opus-4-7">⬛ OPUS 4.7 — MAX INTEL</option>
+            <option value="claude-sonnet-4-6">◆ SONNET 4.6 — CORE</option>
+            <option value="claude-haiku-4-5-20251001">▷ HAIKU 4.5 — RAPID FIRE</option>
+          </select>
+          <div class="model-indicator" id="modelIndicator">AUTO-ROUTING ACTIVE</div>
+        </div>
+        <div class="header-controls">
+          <button class="ctrl-btn" id="voiceToggleBtn" title="Toggle voice output">🔊</button>
+          <button class="ctrl-btn" id="audioLogBtn"    title="Audio Log / Speaking History">📜</button>
+          <button class="ctrl-btn" id="briefingBtn"    title="Daily Briefing">📋</button>
+          <button class="ctrl-btn" id="clearBtn"       title="Clear chat">🗑</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- ═══ MAIN LAYOUT ═══ -->
+    <div class="main-layout">
+
+      <!-- LEFT: Gmail / Communications -->
+      <aside class="panel left-panel" id="gmailPanel">
+        <div class="panel-header">
+          <span class="panel-title">✉ COMMUNICATIONS</span>
+          <button class="panel-btn" id="gmailConnectBtn">CONNECT</button>
+        </div>
+
+        <div class="panel-stats" id="emailStats" style="display:none">
+          <div class="stat-item">
+            <span class="stat-val" id="unreadCount">0</span>
+            <span class="stat-lbl">UNREAD</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-val" id="priorityCount">0</span>
+            <span class="stat-lbl">PRIORITY</span>
+          </div>
+        </div>
+
+        <div class="panel-body" id="emailList">
+          <div class="empty-state">
+            <div class="empty-icon">✉</div>
+            <div class="empty-title">Gmail Offline</div>
+            <div class="empty-sub">Click CONNECT to authorise<br>Gmail access, Master.</div>
+          </div>
+        </div>
+
+        <div class="panel-footer">
+          <button class="footer-btn" id="refreshEmailsBtn" disabled>↻ REFRESH</button>
+          <button class="footer-btn accent" id="getDailyBriefBtn" disabled>★ BRIEF ME</button>
+        </div>
+      </aside>
+
+      <!-- CENTER: Arc Reactor + Chat -->
+      <section class="center-hub">
+
+        <!-- Arc Reactor -->
+        <div class="arc-reactor" id="arcReactor">
+          <div class="arc-ring ring-outer"></div>
+          <div class="arc-ring ring-mid"></div>
+          <div class="arc-ring ring-inner"></div>
+          <div class="arc-core">
+            <div class="arc-core-inner">
+              <div class="arc-triangle"></div>
+            </div>
+          </div>
+          <!-- Corner HUD decorators -->
+          <div class="hud-corner tl"></div>
+          <div class="hud-corner tr"></div>
+          <div class="hud-corner bl"></div>
+          <div class="hud-corner br"></div>
+        </div>
+
+        <!-- Scan line overlay -->
+        <div class="scanline"></div>
+
+        <!-- Chat messages -->
+        <div class="chat-wrap">
+          <div class="chat-messages" id="chatMessages"></div>
+
+          <div class="thinking-bar" id="thinkingBar" style="display:none">
+            <div class="thinking-dots"><span></span><span></span><span></span></div>
+            <span class="thinking-text">Processing, Master...</span>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- RIGHT: Financial Analysis -->
+      <aside class="panel right-panel" id="financialPanel">
+        <div class="panel-header">
+          <span class="panel-title">📊 FINANCIAL CORE</span>
+          <span class="fin-model-badge" id="finModelBadge">OPUS</span>
+        </div>
+
+        <div class="fin-tabs">
+          <button class="fin-tab active" data-tab="analyze">ANALYZE</button>
+          <button class="fin-tab" data-tab="model">MODEL</button>
+          <button class="fin-tab" data-tab="report">REPORT</button>
+          <button class="fin-tab" data-tab="results">RESULTS</button>
+        </div>
+
+        <!-- ANALYZE TAB -->
+        <div class="fin-content active" id="tab-analyze">
+          <select class="fin-select" id="analysisType">
+            <option value="fundamental">Fundamental Analysis</option>
+            <option value="technical">Technical Analysis</option>
+            <option value="portfolio">Portfolio Analysis</option>
+            <option value="dcf">DCF Valuation</option>
+            <option value="risk">Risk Assessment</option>
+            <option value="earnings">Earnings Analysis</option>
+          </select>
+          <textarea class="fin-textarea" id="financialInput"
+            placeholder="Paste financial data, P&L, balance sheet, earnings, or describe what to analyse...
+
+Example:
+Company: Infosys
+Revenue FY24: ₹153,670 Cr
+Revenue FY23: ₹146,767 Cr
+Net Profit FY24: ₹26,248 Cr
+EBITDA margin: 24.6%
+Current Price: ₹1,420
+Market Cap: ₹5.9L Cr"></textarea>
+          <div class="fin-model-row">
+            <label>Analysis Model:</label>
+            <select id="finAnalysisModel" class="fin-select-sm">
+              <option value="claude-opus-4-7">OPUS 4.7 (Deep)</option>
+              <option value="claude-sonnet-4-6">SONNET 4.6 (Fast)</option>
+            </select>
+          </div>
+          <button class="fin-btn" id="analyzeBtn">⚡ ANALYZE</button>
+        </div>
+
+        <!-- MODEL TAB -->
+        <div class="fin-content" id="tab-model">
+          <select class="fin-select" id="modelType">
+            <option value="dcf">DCF Model</option>
+            <option value="lbo">LBO Model</option>
+            <option value="comps">Comparable Companies</option>
+            <option value="portfolio">Portfolio Optimizer</option>
+          </select>
+          <textarea class="fin-textarea" id="modelInput"
+            placeholder="Enter model parameters...
+
+DCF Example:
+Revenue: $500M, Growth: 15%/yr (5yr), then 8%
+EBITDA Margin: 28%
+CapEx: 5% of revenue
+Tax Rate: 25%
+WACC: 10%
+Terminal Growth: 3%
+
+LBO Example:
+Enterprise Value: $1.2B, EBITDA: $120M
+Debt: 5x EBITDA senior + 1x mez
+Hold period: 5 years
+Exit multiple: 8x EBITDA"></textarea>
+          <div class="fin-model-row">
+            <label>Build with:</label>
+            <select id="finBuildModel" class="fin-select-sm">
+              <option value="claude-opus-4-7">OPUS 4.7 (Deep)</option>
+              <option value="claude-sonnet-4-6">SONNET 4.6</option>
+            </select>
+          </div>
+          <button class="fin-btn" id="buildModelBtn">⚡ BUILD MODEL</button>
+        </div>
+
+        <!-- REPORT TAB — real market data, no LLM needed -->
+        <div class="fin-content" id="tab-report">
+          <div class="fin-hint">Live NSE data → Excel model + institutional PDF. No API credits used.</div>
+          <input type="text" class="fin-select" id="reportSymbol" placeholder="Stock symbol — e.g. INFY, TCS, RELIANCE" autocomplete="off" />
+          <button class="fin-btn" id="genReportBtn">📊 GENERATE REPORT</button>
+          <div class="report-status" id="reportStatus" style="display:none"></div>
+          <div class="report-result" id="reportResult" style="display:none">
+            <div class="report-verdict" id="reportVerdict"></div>
+            <div class="report-summary" id="reportSummary"></div>
+            <div class="report-downloads">
+              <a class="fin-btn dl-btn" id="dlExcel" href="#" download>⬇ EXCEL MODEL</a>
+              <a class="fin-btn dl-btn" id="dlPdf" href="#" download>⬇ INSTITUTIONAL PDF</a>
+            </div>
+          </div>
+        </div>
+
+        <!-- RESULTS TAB -->
+        <div class="fin-content" id="tab-results">
+          <div id="analysisResults" class="results-body">
+            <div class="empty-state">
+              <div class="empty-icon">📊</div>
+              <div class="empty-title">No Analysis Yet</div>
+              <div class="empty-sub">Run an analysis or model<br>to see results here.</div>
+            </div>
+          </div>
+
+          <div class="validation-block" id="validationBlock" style="display:none">
+            <div class="val-header">
+              <span>🛡 VALIDATION AGENT</span>
+              <span class="val-score" id="valScore">—</span>
+            </div>
+            <div class="val-grid" id="valGrid"></div>
+            <div class="val-verdict" id="valVerdict"></div>
+          </div>
+        </div>
+
+      </aside>
+    </div>
+
+    <!-- ═══ VOICE FOOTER ═══ -->
+    <footer class="voice-footer">
+      <canvas class="viz-canvas" id="vizCanvas" width="200" height="48"></canvas>
+
+      <button class="mic-btn" id="micBtn" title="Click to toggle continuous listening">
+        <span class="mic-icon" id="micIcon">🎙</span>
+        <div class="mic-ring ring1"></div>
+        <div class="mic-ring ring2"></div>
+      </button>
+
+      <button class="mic-btn whisper-btn" id="whisperBtn" title="Whisper Flow — click to record, click again to transcribe">
+        <span class="mic-icon" id="whisperIcon">🌀</span>
+      </button>
+
+      <div class="input-wrap">
+        <input type="text" class="message-input" id="messageInput"
+          placeholder="Speak or type your command, Master..." autocomplete="off" />
+        <div class="input-glow"></div>
+      </div>
+
+      <button class="send-btn" id="sendBtn">EXECUTE ▶</button>
+
+      <div class="voice-status" id="voiceStatus">STANDBY</div>
+    </footer>
+
+  </div>
+
+  <!-- ═══ SPEAKING SIDEBAR ═══ -->
+  <aside class="speaking-sidebar" id="speakingSidebar">
+
+    <div class="sb-header">
+      <div class="sb-title-row">
+        <div class="sb-wave-bars">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+        <span class="sb-title">AUDIO LOG</span>
+      </div>
+      <button class="sb-close" id="sidebarClose" title="Close">✕</button>
+    </div>
+
+    <!-- Currently speaking block -->
+    <div class="sb-now" id="sbNow" style="display:none">
+      <div class="sb-now-label">
+        <span class="sb-now-dot"></span>NOW SPEAKING
+      </div>
+      <div class="sb-now-text" id="sbNowText"></div>
+      <div class="sb-now-cursor" id="sbCursor"></div>
+    </div>
+
+    <!-- History -->
+    <div class="sb-history-label" id="sbHistLabel" style="display:none">PREVIOUS</div>
+    <div class="sb-history" id="sbHistory"></div>
+
+  </aside>
+
+  <script src="app.js"></script>
+</body>
+</html>
