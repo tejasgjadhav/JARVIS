@@ -201,10 +201,15 @@ function initSpeechRecognition() {
 
   rec.onerror = e => {
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-      setVoiceStatus('MIC BLOCKED — allow microphone access');
-      state.continuousOn = false;   // can't recover without permission
+      // Do NOT permanently disable — this fires transiently at startup before
+      // the permission prompt resolves, and killing continuousOn here left the
+      // mic dead forever. Keep retrying on a slow backoff; a user gesture also retries.
+      setVoiceStatus('MIC BLOCKED — click anywhere / check mic permission');
+      state._micBlocked = true;
+      if (state.continuousOn) scheduleRestart(5000);
       return;
     }
+    state._micBlocked = false;
     if (e.error === 'aborted') return;   // intentional stop
     // no-speech / network / audio-capture → just keep restarting
     if (state.continuousOn) scheduleRestart(300);
@@ -219,6 +224,7 @@ function initSpeechRecognition() {
 
   rec.onstart = () => {
     state.isListening = true;
+    state._micBlocked = false;
     state.lastRecActivity = Date.now();
     if (state.awake) { setMicState('hearing'); setVoiceStatus('LISTENING — speak your command'); }
     else { setMicState('continuous'); setVoiceStatus('AWAITING WAKE WORD — say “Jarvis”'); }
@@ -226,6 +232,17 @@ function initSpeechRecognition() {
 
   state.recognition = rec;
   if (state.continuousOn) scheduleRestart(200);
+
+  // Any user gesture retries a blocked/dead mic (Chrome often needs a gesture
+  // after a permission prompt or an app-window focus change).
+  if (!state._gestureRetry) {
+    state._gestureRetry = true;
+    const kick = () => {
+      if (state.continuousOn && !state.isListening) scheduleRestart(50);
+    };
+    document.addEventListener('click', kick, true);
+    document.addEventListener('keydown', kick, true);
+  }
 
   // ── Watchdog: keep the mic ALWAYS on. If the recogniser silently dies
   //    (network blip, Chrome's ~60s cap), force it back to life — even while
@@ -607,7 +624,10 @@ function speak(text) {
     if (sbCursor) sbCursor.classList.add('done');
     // Resume continuous listening in wake-word mode
     if (state.continuousOn) scheduleRestart(500);
-    setVoiceStatus(state.continuousOn ? 'AWAITING WAKE WORD — say “Jarvis”' : 'STANDBY');
+    // JARVIS just asked a question → open the mic so the user can simply answer
+    // (no need to say "Jarvis" again).
+    if (/\?\s*$/.test(clean) && state.continuousOn) openCommandWindow();
+    else setVoiceStatus(state.continuousOn ? 'AWAITING WAKE WORD — say “Jarvis”' : 'STANDBY');
   };
 
   speechSynthesis.speak(utt);
@@ -791,6 +811,9 @@ function _ttsDrain() {
       state.speakLog.unshift({ text: disp, time: t });
       renderSpeakHistory();
       resumeListeningAfterSpeech();
+      // Streamed reply ended with a question (e.g. "Which company, Master?")
+      // → open the mic so the user can answer without saying "Jarvis".
+      if (/\?\s*$/.test(disp) && state.continuousOn) openCommandWindow();
     }
     // else: more chunks incoming via ttsFeed, wait
   };

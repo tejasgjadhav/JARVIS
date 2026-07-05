@@ -101,7 +101,9 @@ def fy_labels(d, n=5):
 
 def resolve_symbol(query: str):
     """Resolve a company name or stale/renamed ticker to a current NSE (fallback
-    BSE) symbol via Yahoo search — handles delistings, renames, demergers."""
+    BSE) symbol via Yahoo search — handles delistings, renames, demergers.
+    ONLY Indian listings are accepted: a blind first-hit fallback once resolved a
+    query to a foreign penny listing and produced an absurd price (₹0.75)."""
     if not query:
         return None
     try:
@@ -114,7 +116,7 @@ def resolve_symbol(query: str):
             s = q.get("symbol", "")
             if s.endswith(suffix):
                 return s
-    return quotes[0].get("symbol") if quotes else None
+    return None   # nothing on NSE/BSE → let the caller report "not found"
 
 
 def _num(v):
@@ -222,12 +224,25 @@ def fetch_stock(symbol: str) -> dict:
         dy = dy / 100
 
     price = _num(info.get("currentPrice")) or _num(info.get("regularMarketPrice"))
-    if price is None and hist is not None and len(hist):
-        price = _num(hist["Close"].iloc[-1])
+    hist_close = _num(hist["Close"].iloc[-1]) if (hist is not None and len(hist)) else None
+    if price is None:
+        price = hist_close
 
     if price is None:
         raise ValueError(f"No market data found for '{symbol}' (tried {sym}). "
                          f"Use an NSE symbol like INFY, TCS, RELIANCE.")
+
+    # ── PRICE SANITY GUARDS (a bad quote once showed ₹0.75 on a ₹4,600 stock) ──
+    price_note = None
+    # 1. Quote vs last historical close: >15% apart → trust the price series.
+    if hist_close and price and abs(price / hist_close - 1) > 0.15:
+        price_note = f"quote ₹{price:,.2f} conflicted with last close ₹{hist_close:,.2f}; using close"
+        price = hist_close
+    # 2. Quote vs 52-week band: far outside → trust the price series.
+    _wl, _wh = _num(info.get("fiftyTwoWeekLow")), _num(info.get("fiftyTwoWeekHigh"))
+    if _wl and _wh and not (0.5 * _wl <= price <= 1.5 * _wh) and hist_close and (0.5 * _wl <= hist_close <= 1.5 * _wh):
+        price_note = f"quote outside 52-wk sanity band; using last close ₹{hist_close:,.2f}"
+        price = hist_close
 
     dma50 = _num(info.get("fiftyDayAverage"))
     dma200 = _num(info.get("twoHundredDayAverage"))
@@ -316,6 +331,7 @@ def fetch_stock(symbol: str) -> dict:
         "revenue": _fx(rev_stmt or _num(info.get("totalRevenue"))),
         "fin_ccy": fin_ccy, "fx": fx,
         "quarter_end": q_end, "data_ref_date": ref_date,
+        "price_note": price_note,
         "tech": tech, "rating_dist": rating_dist, "brokers": brokers,
         "rev_cagr": rev_cagr,
         "rev_hist_cr": [_fx(x) / 1e7 for x in rev_hist] if rev_hist else None,
@@ -704,22 +720,23 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
 
 
 def cross_validate_price(symbol: str, yf_price: float, timeout: int = 8) -> dict:
-    """Independent price check against Google Finance (NSE). Part of the Python
-    validation layer: flags if yfinance's price diverges >2% from a second source."""
-    base = (symbol or "").replace(".NS", "").replace(".BO", "")
+    """Independent price check against Google Finance (a non-Yahoo source). Part
+    of the Python validation layer: flags if yfinance's price diverges >2%."""
+    sym = (symbol or "").upper()
+    exch = "BOM" if sym.endswith(".BO") else "NSE"
+    base = sym.replace(".NS", "").replace(".BO", "")
     try:
         import urllib.request
         req = urllib.request.Request(
-            f"https://www.google.com/finance/quote/{base}:NSE",
+            f"https://www.google.com/finance/quote/{base}:{exch}",
             headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                      "Accept-Language": "en-US,en;q=0.9"})
         html = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "ignore")
         import re as _re
-        m = _re.search(r'class="YMlKec fxKbKc">\s*₹\s*([0-9,]+(?:\.[0-9]+)?)', html)
-        if not m:
-            # class names vary by rendering — the first ₹ figure on the page is the header quote
-            m = _re.search(r'₹\s*([0-9,]+\.[0-9]{2})', html)
+        m = (_re.search(r'data-last-price="([0-9.]+)"', html)
+             or _re.search(r'class="YMlKec fxKbKc">\s*₹\s*([0-9,]+(?:\.[0-9]+)?)', html)
+             or _re.search(r'₹\s*([0-9,]+\.[0-9]{2})', html))
         if not m:
             return {"ok": None, "note": "second source unavailable"}
         gp = float(m.group(1).replace(",", ""))
@@ -2134,12 +2151,31 @@ def _parse_narrative(text: str):
     return None
 
 
+def _price_validation_checks(d):
+    """Price-integrity entries for the validation layer: cross-source check +
+    any sanity-guard correction applied during fetch."""
+    checks = []
+    pv = cross_validate_price(d["symbol"], d["price"])
+    if pv.get("ok") is None:
+        checks.append({"name": "price cross-check (2nd source)", "pass": True,
+                       "detail": pv.get("note", "n/a") + " — 52-wk sanity guard applied instead"})
+    else:
+        checks.append({"name": "price cross-check (2nd source)", "pass": pv["ok"],
+                       "detail": f"yfinance ₹{d['price']:,.2f} vs Google ₹{pv['google_price']:,.2f} "
+                                 f"({pv['diff_pct']}% diff)"})
+    if d.get("price_note"):
+        checks.append({"name": "price sanity guard (auto-corrected)", "pass": True,
+                       "detail": d["price_note"]})
+    return checks
+
+
 def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") -> dict:
     recency = data_recency(d)
     # ── SHORT-TERM: technical note, no DCF ──
     if horizon == "short":
         excel = build_excel_short(d, a, narrative)
         tech = d.get("tech") or {}
+        pchecks = _price_validation_checks(d)
         result = {
             "symbol": d["symbol"], "name": d["name"], "horizon": "short",
             "verdict": final_verdict(a, narrative), "quant_verdict": a["verdict"], "action": a["action"],
@@ -2147,12 +2183,12 @@ def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") ->
             "data_asof": recency["asof"], "data_status": recency["status"],
             "authored_by": "Claude + live technicals" if narrative else "Technical engine",
             "levels": (narrative or {}).get("levels"),
-            "validation": {"ok": bool(tech), "checks": [
+            "validation": {"ok": bool(tech) and all(c["pass"] for c in pchecks), "checks": [
                 {"name": "technical indicators computed", "pass": bool(tech),
                  "detail": f"RSI {tech.get('rsi',0):.0f} · 50/200-DMA present" if tech else "no history"},
                 {"name": "data recency (latest/prev quarter)", "pass": recency["ok"],
                  "detail": f"{recency['status']} — as-of {recency['asof']}"},
-            ]},
+            ] + pchecks},
             "excel": excel, "pdf": build_pdf_short(d, a, narrative),
         }
         result["numbers"] = ""
@@ -2172,20 +2208,11 @@ def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") ->
         })
         if not recency["ok"]:
             validation["ok"] = False
-        # Price cross-validated against a second source (Google Finance NSE)
-        pv = cross_validate_price(d["symbol"], d["price"])
-        if pv.get("ok") is None:
-            validation["checks"].append({"name": "price cross-check (2nd source)",
-                                         "pass": True, "detail": pv.get("note", "n/a")})
-        else:
-            validation["checks"].append({
-                "name": "price cross-check (2nd source)",
-                "pass": pv["ok"],
-                "detail": f"yfinance ₹{d['price']:,.2f} vs Google ₹{pv['google_price']:,.2f} "
-                          f"({pv['diff_pct']}% diff)",
-            })
-            if not pv["ok"]:
-                validation["ok"] = False
+        # Price integrity: cross-source check + sanity-guard note
+        pchecks = _price_validation_checks(d)
+        validation["checks"].extend(pchecks)
+        if not all(c["pass"] for c in pchecks):
+            validation["ok"] = False
     result = {
         "symbol": d["symbol"],
         "name": d["name"],
