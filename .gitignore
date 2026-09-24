@@ -22,3 +22,4 @@ venv/
 reports/
 *.xlsx
 *.pdf
+HANDOFF.md
