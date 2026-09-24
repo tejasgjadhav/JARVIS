@@ -245,15 +245,17 @@ def _jev_loop(d, a, narrative, horizon='long'):
                       'lines': [f"Claude's first verdict: {str(narrative.get('verdict') or '?').upper()}"
                                 + (f" — {narrative['verdict_rationale']}" if narrative.get('verdict_rationale') else "") + "."]})
         step += 1
+    tri = R.triangulation_for(d, a, narrative)
     jev = jev_judge.judge(d, a, narrative, horizon, dcf_fair_value=fv, dcf_detail=detail,
-                          triangulation=R.triangulation_for(d, a, narrative), data_quality=dq)
+                          triangulation=tri, data_quality=dq,
+                          reconciled=R.reconcile_value(tri, narrative, d['price']))
     if not jev:
         trail.append({'step': step, 'title': 'Jev was unavailable',
                       'lines': ['The verdict falls back to Claude, then to the rule scorecard.']})
         return narrative, None, trail
     trail.append({'step': step, 'title': 'JARVIS sent the evidence to Jev', 'lines': jev['sent']})
     step += 1
-    trail.append({'step': step, 'title': 'JARVIS asked Jev five questions' if narrative else 'JARVIS asked Jev three questions',
+    trail.append({'step': step, 'title': 'JARVIS asked Jev six questions' if narrative else 'JARVIS asked Jev three questions',
                   'lines': jev['asked']}); step += 1
     trail.append({'step': step, 'title': 'Jev answered (round 1)', 'lines': jev['received']}); step += 1
     for rnd in range(JEV_FEEDBACK_ROUNDS):
@@ -262,6 +264,24 @@ def _jev_loop(d, a, narrative, horizon='long'):
                           'lines': ['Claude did not write a narrative, so there is nothing to revise; Jev\'s round-1 call is final.']})
             break
         claude_v = str(narrative.get('verdict') or '').upper() or None
+        # Gate: revise only when there is something to fix. Agreement plus sound
+        # checks means a second Opus round would only be written to please the judge.
+        reasons = []
+        if claude_v and claude_v != jev['verdict']:
+            reasons.append(f"Jev's composed call {jev['verdict']} differs from Claude's {claude_v}")
+        if (jev.get('thesis_consistent') or 1) < 0.5:
+            reasons.append(f"the thesis is consistent with the figures only {jev['thesis_consistent']*100:.0f}% of the time")
+        if (jev.get('numbers_back_verdict') or 1) < 0.5:
+            reasons.append(f"the figures justify Claude's call only {jev['numbers_back_verdict']*100:.0f}%")
+        if (jev.get('weighting_justified') or 1) < 0.5:
+            reasons.append(f"Claude's valuation-method weights look wrong for this company ({jev['weighting_justified']*100:.0f}% justified)")
+        if not reasons:
+            trail.append({'step': step, 'title': 'No feedback round needed',
+                          'lines': ["Jev's call matches Claude's, and every check on Claude's note scored 50% or better. "
+                                    "A revision would only be written to please the judge, so round 1 is final."]})
+            break
+        trail.append({'step': step, 'title': 'Why a feedback round is needed', 'lines': [r[0].upper() + r[1:] + '.' for r in reasons]})
+        step += 1
         fb = jev_judge.feedback_for_claude(jev, claude_v)
         trail.append({'step': step, 'title': f'JARVIS sent Jev\'s feedback back to Claude (round {rnd + 2})',
                       'lines': fb.split('\n') + ['Claude was told: revise the analysis, keep every number grounded, return the same structure.']})
@@ -278,8 +298,10 @@ def _jev_loop(d, a, narrative, horizon='long'):
                                 f"Revised thesis: {str(revised.get('thesis', ''))[:200]}"]})
         step += 1
         fv2, detail2 = R.dcf_for_jev(d, a, revised)
+        tri2 = R.triangulation_for(d, a, revised)
         jev2 = jev_judge.judge(d, a, revised, horizon, dcf_fair_value=fv2, dcf_detail=detail2,
-                               triangulation=R.triangulation_for(d, a, revised), data_quality=dq)
+                               triangulation=tri2, data_quality=dq,
+                               reconciled=R.reconcile_value(tri2, revised, d['price']))
         if not jev2:
             trail.append({'step': step, 'title': 'Jev was unavailable for the re-run',
                           'lines': ['Round-1 Jev call stands; the revised narrative is still shown.']})
@@ -305,6 +327,9 @@ def _jev_loop(d, a, narrative, horizon='long'):
         'horizon': horizon, 'price': d['price'], 'verdict': jev['verdict'], 'confidence': jev['confidence'],
         'stance': jev['stance'], 'interval': jev['interval'], 'probabilities': jev['probabilities'],
         'valuation': jev['valuation']['score'], 'downside_risk': jev['downside_risk']['score'],
+        'business_quality': jev['business_quality']['score'], 'direct_call': jev['direct_call']['choice'],
+        'reconciled_fair_value': (jev.get('reconciled') or {}).get('fair_value_inr'),
+        'weighting_justified': jev.get('weighting_justified'),
         'numbers_back_verdict': jev.get('numbers_back_verdict'), 'thesis_consistent': jev.get('thesis_consistent'),
         'claude_verdict': (jev.get('agreement') or {}).get('claude'), 'quant_verdict': a.get('verdict'),
         'triangulation': jev.get('triangulation'), 'judge_pleasing_flag': jev.get('judge_pleasing_flag', False),

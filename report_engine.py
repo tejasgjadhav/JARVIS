@@ -720,6 +720,8 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
         rblock.append(jev_judge.summary_line(j))
         rblock.append("Distribution: " + jev_judge.distribution_line(j))
         rblock.append(jev_judge.support_line(j))
+        if j.get("reconciled_line"):
+            rblock.append(j["reconciled_line"])
         if j.get("method_check"):
             rblock.append(j["method_check"])
         if j.get("sizing"):
@@ -991,6 +993,7 @@ def _jev_rows(a: dict):
         (f"Jev {int(j['interval_mass']*100)}% interval", f"{lo} to {hi}" if lo != hi else lo),
         ("Jev distribution", jev_judge.distribution_line(j)),
         ("Jev valuation / risk", jev_judge.support_line(j)),
+        ("Jev reconciled value", j.get("reconciled_line") or "—"),
         ("Jev sizing", j.get("sizing") or "—"),
         ("Jev method check", j.get("method_check") or "—"),
     ]
@@ -1563,6 +1566,8 @@ def _jev_pdf(story, a: dict, body):
         f"{int(j['interval_mass']*100)}% credible interval {rng}", body))
     story.append(Paragraph("Distribution: " + jev_judge.distribution_line(j), body))
     story.append(Paragraph(jev_judge.support_line(j), body))
+    if j.get("reconciled_line"):
+        story.append(Paragraph(j["reconciled_line"], body))
     if j.get("method_check"):
         story.append(Paragraph(j["method_check"], body))
     if j.get("sizing"):
@@ -1996,6 +2001,8 @@ def compose_short(d: dict, a: dict, narrative, result: dict):
         rb.append(jev_judge.summary_line(j))
         rb.append("Distribution: " + jev_judge.distribution_line(j))
         rb.append(jev_judge.support_line(j))
+        if j.get("reconciled_line"):
+            rb.append(j["reconciled_line"])
         if j.get("method_check"):
             rb.append(j["method_check"])
         if j.get("sizing"):
@@ -2231,6 +2238,12 @@ def build_prompt(d: dict, a: dict):
         "margin', 'We use a 12.5% WACC vs the street's implied ~10%', 'We assume FY26 revenue growth of "
         "6% vs consensus ~10% on weaker discretionary demand'). Empty string if no consensus given.\n"
         "- recommendation: 2 sentence rationale for a 3-5 year horizon\n"
+        "- method_weights: object giving the weight (0 to 1, summing to 1) you place on each valuation "
+        "method for THIS company: dcf, comps, sotp, scenarios, price_target, street. Weight the DCF low "
+        "when free cash flow is negative or margins are still ramping; weight comps low when there is no "
+        "true peer; weight sotp only for multi-segment companies; give the street a small weight at most. "
+        "Set a method to 0 if you do not use it.\n"
+        "- method_weights_reason: ONE sentence saying why the weights are right for this company's economics.\n"
         "- price_target: number (your 12-month fair value in INR) or null\n"
         "- scenarios: object with keys bull, base, bear — each an object "
         "{target:<INR number>, probability:<decimal, the three sum to ~1>, driver:'<one line: what "
@@ -2276,6 +2289,8 @@ def build_prompt(d: dict, a: dict):
         'Example shape: {"thesis":"...","business":"...","bull_case":["..."],'
         '"bear_case":["..."],"catalysts":["..."],"risks":["..."],'
         '"verdict":"ACCUMULATE","verdict_rationale":"Quality franchise, fair value, stagger entries",'
+        '"method_weights":{"dcf":0.45,"comps":0.25,"sotp":0,"scenarios":0.15,"price_target":0.1,"street":0.05},'
+        '"method_weights_reason":"Mature cash generator, so the DCF carries most weight; comps second because listed peers are direct.",'
         '"vs_consensus":"Street targets ₹4,100 (BUY, 22 analysts); we are 8% below on a stiffer 12.5% WACC and slower FY26 growth.",'
         '"divergence_factor":"We model FY26 EBIT margin ~300bps below consensus on wage inflation.",'
         '"scenarios":{"bull":{"target":4600,"probability":0.25,"driver":"Margin recovery + faster growth"},'
@@ -2360,6 +2375,39 @@ def triangulation_for(d: dict, a: dict, narrative=None):
         add("Street mean target", cons["mean"], {"low": cons.get("low"), "high": cons.get("high"),
                                                 "num_analysts": cons.get("n"), "street_call": cons.get("rec")})
     return rows
+
+
+METHOD_KEYS = {"DCF (Claude's assumptions)": "dcf", "Peer comps": "comps", "Sum-of-the-parts": "sotp",
+               "Probability-weighted scenarios": "scenarios", "Analyst's 12-month target (Claude)": "price_target",
+               "Street mean target": "street"}
+
+
+def reconcile_value(triangulation, narrative=None, price=None):
+    """Weighted fair value across the methods present. Claude's weights when it
+    gave them (renormalised over the methods that actually produced a value),
+    else equal weights. Returns None when nothing to reconcile."""
+    n = narrative or {}
+    raw = n.get("method_weights") or {}
+    rows = [m for m in (triangulation or []) if m.get("value_inr")]
+    if not rows:
+        return None
+    w = {}
+    for m in rows:
+        key = METHOD_KEYS.get(m["method"], m["method"])
+        try:
+            w[m["method"]] = max(0.0, float(raw.get(key, 0.0))) if raw else 1.0
+        except (TypeError, ValueError):
+            w[m["method"]] = 0.0
+    tot = sum(w.values())
+    if tot <= 0:
+        w = {m["method"]: 1.0 for m in rows}; tot = float(len(rows))
+    w = {k: v / tot for k, v in w.items()}
+    fv = sum(m["value_inr"] * w[m["method"]] for m in rows)
+    return {"fair_value_inr": round(fv, 2),
+            "upside_pct": round((fv / price - 1) * 100, 1) if price else None,
+            "weights": {k: round(v, 3) for k, v in w.items()},
+            "source": "Claude's weights" if raw else "equal weights (Claude gave none)",
+            "reason": n.get("method_weights_reason") or None}
 
 
 def data_quality_for(d: dict):
@@ -2451,9 +2499,10 @@ def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long",
     # as `jev` (+ the plain-English `trail`); a bare call judges once here. ──
     if jev is None:
         _fv, _detail = dcf_for_jev(d, a, narrative)
+        _tri = triangulation_for(d, a, narrative)
         jev = jev_judge.judge(d, a, narrative, horizon, dcf_fair_value=_fv, dcf_detail=_detail,
-                              triangulation=triangulation_for(d, a, narrative),
-                              data_quality=data_quality_for(d))
+                              triangulation=_tri, data_quality=data_quality_for(d),
+                              reconciled=reconcile_value(_tri, narrative, d["price"]))
     a["jev"] = jev
     a["jev_trail"] = trail or []
     # ── SHORT-TERM: technical note, no DCF ──

@@ -1,6 +1,22 @@
 # Handoff — JARVIS × Jev final-decision integration
 _Updated: 2026-09-24 (later) by Claude Code (Fable 5.1)_
 
+## Third pass (2026-09-24) — items 1–3 of the 9.5 plan, DONE in code
+1. Method reconciliation: Claude returns `method_weights` + `method_weights_reason` (build_prompt);
+   `reconcile_value()` computes the weighted fair value; Jev answers `weighting_justified` (Noul).
+2. Split verdict: Jev scores `business_quality` (0–3, price ignored) and `valuation` (0–3);
+   `jev_judge.compose_call()` multiplies the two spreads through the COMPOSE matrix into the
+   five-way call, confidence (5·max−1)/4, interval. Jev's direct Choice kept as `direct_call`.
+   Offline Eternal: composed REDUCE 66%/0.58 vs direct HOLD 0.38 — decomposition is sharper.
+3. Gated feedback round (`server._jev_loop`): runs only if composed call ≠ Claude's, or
+   thesis_consistent / numbers_back_verdict / weighting_justified < 0.5; trail says why or why not.
+Live Eternal run 4 DONE: Claude HOLD → composed REDUCE 79% (avg business × expensive price), thesis
+consistent 26% → feedback round fired → Claude revised to REDUCE → Jev round 2 REDUCE 63%, conf 0.53,
+interval SELL–REDUCE, direct pick also REDUCE 0.76; reconciled FV ₹262 (-24%), weighting justified 50%.
+PDF (9pp), MP4, still and post text in ~/Downloads rebuilt from run 4 (`eternal4_agent.json` in the
+session scratchpad). Rating claim: 9/10 in code; 9.5 waits on the calibration log. Chrome still
+not connected for the LinkedIn post.
+
 ## LinkedIn post (2026-09-24, renamed) — READY, NOT POSTED
 He renamed the public assets: "Equity Analyst Agent (LLM: Claude)", angle "How Jev helps in
 equity analysis", Eternal example. New files in ~/Downloads: `Equity_Analyst_Agent_Jev_Workflow.pdf`

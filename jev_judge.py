@@ -50,6 +50,20 @@ RISK_LEVELS = [
     "Severe: several serious risks at once; a large permanent loss is plausible.",
 ]
 VALUATION_SHORT = ["expensive", "fully valued", "modestly cheap", "undervalued"]
+QUALITY_LEVELS = [
+    "Poor: weak or negative returns on capital, unstable or loss-making earnings, a balance sheet or competitive position that is deteriorating.",
+    "Average: adequate returns, ordinary growth, no durable advantage; a business one would own only at a clearly cheap price.",
+    "Good: solid returns on capital, a real competitive position, growth funded from its own cash; worth owning at a fair price.",
+    "Excellent: high and durable returns on capital, a strong moat, long runway, conservative balance sheet; worth owning through cycles.",
+]
+QUALITY_SHORT = ["poor", "average", "good", "excellent"]
+# Composition matrix: business quality (rows 0-3) x price attractiveness (cols 0-3) -> call.
+COMPOSE = [
+    ["SELL",   "SELL",       "REDUCE",     "HOLD"],        # poor business
+    ["REDUCE", "REDUCE",     "HOLD",       "ACCUMULATE"],  # average business
+    ["REDUCE", "HOLD",       "ACCUMULATE", "BUY"],         # good business
+    ["HOLD",   "ACCUMULATE", "BUY",        "BUY"],         # excellent business
+]
 RISK_SHORT = ["low", "moderate", "elevated", "severe"]
 
 
@@ -99,7 +113,7 @@ def _clean(v):
 
 
 def build_state(d: dict, a: dict, narrative, horizon: str, dcf_fair_value=None,
-                dcf_detail=None, triangulation=None, data_quality=None) -> dict:
+                dcf_detail=None, triangulation=None, data_quality=None, reconciled=None) -> dict:
     price = d["price"]
     metric_keys = ("pe", "forward_pe", "peg", "pb", "roe", "margin", "rev_growth",
                    "earn_growth", "debt_to_equity", "div_yield", "beta",
@@ -141,6 +155,8 @@ def build_state(d: dict, a: dict, narrative, horizon: str, dcf_fair_value=None,
             "note": "Each method's fair value per share and its gap to the current price. "
                     "Weigh them together; no single method is the answer.",
             "methods": _clean(triangulation)}
+        if reconciled:
+            state["valuation_triangulation"]["reconciled"] = _clean(reconciled)
     if data_quality:
         state["data_quality"] = _clean(data_quality)
     tm = d.get("target_mean")
@@ -194,6 +210,14 @@ def build_questions(has_narrative: bool) -> dict:
                 "SELL": "Exit the position. The evidence shows unfavourable risk/reward, deteriorating fundamentals, or a valuation the numbers do not support.",
             },
         },
+        "business_quality": {
+            "type": "score",
+            "instructions": ("Judged on the business alone, ignoring today's price: how good a business is this "
+                             "to own for the stated horizon? Use `key_metrics` (returns, margins, growth, leverage, "
+                             "cash flow), `business_summary`, the scorecard factors and the narrative's bull and bear "
+                             "cases. Price, multiples and fair-value gaps do NOT belong in this judgment."),
+            "criteria": QUALITY_LEVELS,
+        },
         "valuation": {
             "type": "score",
             "instructions": ("How much does the valuation evidence support paying the current price? "
@@ -212,6 +236,16 @@ def build_questions(has_narrative: bool) -> dict:
         },
     }
     if has_narrative:
+        q["weighting_justified"] = {
+            "type": "noul",
+            "instructions": (
+                "The weights in `valuation_triangulation.reconciled.weights`, with the reason in "
+                "`valuation_triangulation.reconciled.reason`, are the right weights for a company with these "
+                "economics. Answer no if a method that is unreliable here carries real weight (a DCF on negative "
+                "or ramping free cash flow, comps with no true peer, SOTP for a single-segment business), or if "
+                "a method that suits this company was given little or no weight."
+            ),
+        }
         q["numbers_back_verdict"] = {
             "type": "noul",
             "instructions": (
@@ -267,6 +301,11 @@ def describe_state(state: dict) -> list:
         out.append("Every valuation method side by side: " + "; ".join(
             f"{m['method']} Rs {m['value_inr']:,.0f} ({m['upside_pct']:+.0f}%)" for m in tri
             if m.get("value_inr")) + ".")
+        rc = (state.get("valuation_triangulation") or {}).get("reconciled")
+        if rc:
+            out.append(f"Claude's weights on those methods and the reconciled fair value they give: "
+                       f"Rs {rc['fair_value_inr']:,.0f} ({rc['upside_pct']:+.0f}%), from {rc['source']}"
+                       + (f"; Claude's reason: {rc['reason']}" if rc.get("reason") else "") + ".")
     dq = state.get("data_quality")
     if dq:
         out.append(f"Data quality: financials {dq.get('financials_status')} (as of {dq.get('financials_asof')}); "
@@ -302,29 +341,40 @@ def describe_state(state: dict) -> list:
 
 
 def describe_questions(q: dict) -> list:
-    out = ["Question 1 (a choice): pick the final call, one of SELL, REDUCE, HOLD, ACCUMULATE, BUY, "
-           "weighing the numbers over the narrative's tone. Jev returns a probability for each option.",
+    out = ["Question 1 (a 0–3 score): judged on the business alone, ignoring price, how good a business "
+           "is this to own (poor / average / good / excellent)?",
            "Question 2 (a 0–3 score): how much the valuation supports paying today's price, weighing "
            "every method together: DCF, peer comps, sum-of-the-parts, scenario-weighted target, "
            "analyst target, street mean and range, plus the multiples "
            "(expensive / fully valued / modestly cheap / undervalued).",
            "Question 3 (a 0–3 score): how large the risk of a material loss is over the horizon "
            "(low / moderate / elevated / severe)."]
+    if "weighting_justified" in q:
+        out.append("Question 4 (yes/no probability): are Claude's weights on the valuation methods right for this company's economics?")
     if "numbers_back_verdict" in q:
-        out.append("Question 4 (yes/no probability): do the figures justify Claude's call at this price?")
-        out.append("Question 5 (yes/no probability): is every claim in Claude's thesis consistent with the figures?")
+        out.append("Question 5 (yes/no probability): do the figures justify Claude's call at this price?")
+        out.append("Question 6 (yes/no probability): is every claim in Claude's thesis consistent with the figures?")
+    out.append("Cross-check (a choice): Jev's own direct pick of SELL, REDUCE, HOLD, ACCUMULATE or BUY, kept for comparison only.")
+    out.append("The call itself is composed in code from questions 1 and 2: business quality times price attractiveness, "
+               "so a good business at an expensive price is HOLD, and a poor business at a cheap price is at best HOLD.")
     return out
 
 
 def describe_answer(j: dict) -> list:
     lo, hi = j["interval"]
-    out = [f"Jev's call: {j['verdict']} at {j['probabilities'][j['verdict']]*100:.0f}% probability, "
+    out = [f"The composed call: {j['verdict']} at {j['probabilities'][j['verdict']]*100:.0f}% probability, "
            f"confidence {j['confidence']:.2f} ({j['conviction']}).",
+           f"Business quality {j['business_quality']['score']:.1f}/3 ({j['business_quality']['label']}); "
+           f"price attractiveness {j['valuation']['score']:.1f}/3 ({j['valuation']['label']}).",
+           f"Jev's direct pick, for comparison: {j['direct_call']['choice']} "
+           f"(confidence {j['direct_call']['confidence']:.2f}).",
            f"The full spread: {distribution_line(j)}.",
            f"The 80% interval: " + (f"{lo} to {hi}" if lo != hi else f"{lo} alone") +
            " (the range that holds 80% of Jev's probability).",
            f"Valuation {j['valuation']['score']:.1f}/3 ({j['valuation']['label']}); "
            f"downside risk {j['downside_risk']['score']:.1f}/3 ({j['downside_risk']['label']})."]
+    if j.get("reconciled_line"):
+        out.append(j["reconciled_line"])
     if j.get("numbers_back_verdict") is not None:
         out.append(f"Do the figures justify Claude's call? {j['numbers_back_verdict']*100:.0f}% yes.")
     if j.get("thesis_consistent") is not None:
@@ -349,6 +399,10 @@ def feedback_for_claude(j: dict, claude_verdict) -> str:
         f"Valuation support: {j['valuation']['score']:.1f}/3 ({j['valuation']['label']}). "
         f"Downside risk: {j['downside_risk']['score']:.1f}/3 ({j['downside_risk']['label']}).",
     ]
+    if j.get("weighting_justified") is not None:
+        lines.append(f"Probability that your valuation-method weights suit this company: {j['weighting_justified']*100:.0f}%. "
+                     f"Reconciled fair value on your weights: Rs {j['reconciled']['fair_value_inr']:,.0f}." if j.get("reconciled") else
+                     f"Probability that your valuation-method weights suit this company: {j['weighting_justified']*100:.0f}%.")
     if j.get("numbers_back_verdict") is not None:
         lines.append(f"Probability that the figures justify your call: {j['numbers_back_verdict']*100:.0f}%.")
     if j.get("thesis_consistent") is not None:
@@ -490,19 +544,38 @@ def _post(payload: dict) -> dict:
     raise RuntimeError("Jev: retries exhausted")
 
 
+def compose_call(quality_probs: dict, price_probs: dict) -> dict:
+    """Combine the two narrow judgments into a five-way distribution over the
+    call, treating the two Score distributions as independent. Confidence is the
+    same concentration idea TypeSafe uses: (k*max - 1)/(k - 1) over k=5 options."""
+    probs = {k: 0.0 for k in VERDICTS}
+    for qi in range(4):
+        for pi in range(4):
+            probs[COMPOSE[qi][pi]] += float(quality_probs.get(str(qi), 0.0)) * float(price_probs.get(str(pi), 0.0))
+    tot = sum(probs.values()) or 1.0
+    probs = {k: v / tot for k, v in probs.items()}
+    top = max(probs, key=probs.get)
+    conf = max(0.0, min(1.0, (5 * probs[top] - 1) / 4))
+    return {"choice": top, "probabilities": probs, "confidence": conf}
+
+
 def judge(d: dict, a: dict, narrative=None, horizon="long", dcf_fair_value=None, dcf_detail=None,
-          triangulation=None, data_quality=None):
+          triangulation=None, data_quality=None, reconciled=None):
     """Return Jev's decision dict, or None when Jev is unavailable or errors.
     Never raises: a Jev outage must not take the report down."""
     if not available():
         return None
     try:
         state = build_state(d, a, narrative, horizon, dcf_fair_value, dcf_detail,
-                            triangulation, data_quality)
+                            triangulation, data_quality, reconciled)
         questions = build_questions(bool(narrative))
         r = _post({"model": MODEL, "state": state, "questions": questions})
         ans = r["answers"]
-        v = ans["verdict"]
+        # The call is COMPOSED from two narrow judgments (business quality x price).
+        # Jev's direct five-way choice is kept as a cross-check only.
+        v = compose_call(ans["business_quality"].get("probabilities") or {},
+                         ans["valuation"].get("probabilities") or {})
+        direct = ans["verdict"]
         probs = {k: float(v["probabilities"].get(k, 0.0)) for k in VERDICTS}
         ordered = [(k, probs[k]) for k in VERDICTS]
         lo, hi = credible_interval(ordered)
@@ -518,8 +591,14 @@ def judge(d: dict, a: dict, narrative=None, horizon="long", dcf_fair_value=None,
             "interval": [lo, hi],
             "interval_mass": INTERVAL_MASS,
             "stance": round(stance, 2),
+            "business_quality": _score_block(ans["business_quality"], QUALITY_SHORT),
             "valuation": _score_block(ans["valuation"], VALUATION_SHORT),
             "downside_risk": _score_block(ans["downside_risk"], RISK_SHORT),
+            "direct_call": {"choice": direct["choice"], "confidence": round(float(direct.get("confidence", 0)), 2),
+                            "probabilities": {k: round(float(direct["probabilities"].get(k, 0.0)), 3) for k in VERDICTS}},
+            "weighting_justified": (round(float(ans["weighting_justified"]["noul"]), 2)
+                                    if "weighting_justified" in ans else None),
+            "reconciled": _clean(reconciled) if reconciled else None,
             "numbers_back_verdict": (round(float(ans["numbers_back_verdict"]["noul"]), 2)
                                      if "numbers_back_verdict" in ans else None),
             "thesis_consistent": (round(float(ans["thesis_consistent"]["noul"]), 2)
@@ -530,6 +609,7 @@ def judge(d: dict, a: dict, narrative=None, horizon="long", dcf_fair_value=None,
             "sent": describe_state(state),
             "asked": describe_questions(questions),
         }
+        out["reconciled_line"] = reconciled_line(out)
         out["sizing"] = position_guidance(out)
         out["method_check"] = method_check(out, triangulation)
         out["triangulation"] = _clean(triangulation) if triangulation else None
@@ -554,9 +634,25 @@ def summary_line(j: dict) -> str:
             f"{int(j['interval_mass']*100)}% interval {rng}")
 
 
+def reconciled_line(j: dict) -> str:
+    rc = j.get("reconciled")
+    if not rc:
+        return ""
+    line = (f"Reconciled fair value ₹{rc['fair_value_inr']:,.0f} ({rc['upside_pct']:+.0f}%) from "
+            f"{rc['source']}: " + ", ".join(f"{k.split(' (')[0]} {v*100:.0f}%" for k, v in rc["weights"].items() if v > 0))
+    if j.get("weighting_justified") is not None:
+        line += f" · weighting justified: {j['weighting_justified']*100:.0f}%"
+    if rc.get("reason"):
+        line += f" · {rc['reason']}"
+    return line
+
+
 def support_line(j: dict) -> str:
     val, risk = j["valuation"], j["downside_risk"]
-    parts = [f"Valuation {val['score']:.1f}/{val['max']} ({val['label']}; "
+    bq = j.get("business_quality")
+    parts = ([f"Business quality {bq['score']:.1f}/{bq['max']} ({bq['label']}; "
+              f"80% interval {bq['interval'][0]}–{bq['interval'][1]})"] if bq else []) + \
+            [f"Valuation {val['score']:.1f}/{val['max']} ({val['label']}; "
              f"80% interval {val['interval'][0]}–{val['interval'][1]})",
              f"Downside risk {risk['score']:.1f}/{risk['max']} ({risk['label']}; "
              f"80% interval {risk['interval'][0]}–{risk['interval'][1]})"]
