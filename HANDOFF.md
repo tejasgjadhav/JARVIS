@@ -1,6 +1,14 @@
 # Handoff — JARVIS × Jev final-decision integration
 _Updated: 2026-09-24 (later) by Claude Code (Fable 5.1)_
 
+## Video (2026-09-24, evening) — 16:9 rebuild in progress
+He uploaded the 4:5 MP4 to LinkedIn's composer himself (his Chrome, Tejas(bia)) and it pillarboxed;
+asked for rectangular + more creative. `tools/jev_flow_video_wide.py` renders 1920x1080, four scenes
+(dark hook → serpentine pipeline, cards enter one by one → verdict scene with HOLD struck through,
+two Jev score bars, REDUCE stamp → closing card), crossfades, disclaimer footer on every scene.
+Output `~/Downloads/Equity_Analyst_Agent_Jev_Flow_16x9.mp4` + four `_s1.._s4.png` stills.
+Post text (short, voice-passed) is `~/Downloads/Equity_Analyst_Agent_Jev_LinkedIn_post.txt`.
+
 ## Compliance pass (2026-09-24) — he is a covered person at TIAA
 Public assets now: Eternal named (his call), ALL rupee amounts/prices/targets withheld, technicals
 line dropped, disclaimer on PDF page 1 + last page, in the video footer and at the end of the post.
