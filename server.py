@@ -32,7 +32,14 @@ GOOGLE_CLIENT_ID     = os.getenv('GOOGLE_CLIENT_ID', '')
 GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET', '')
 REDIRECT_URI = f'http://localhost:{PORT}/api/gmail/callback'
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
+# Backend: 'cli' = local `claude` CLI on the Max subscription (no API key),
+# 'api' = anthropic SDK with ANTHROPIC_API_KEY. Default: cli.
+CLAUDE_BACKEND = os.getenv('CLAUDE_BACKEND', 'cli').lower()
+if CLAUDE_BACKEND == 'api':
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
+else:
+    from claude_cli import ClaudeCLIClient
+    client = ClaudeCLIClient()
 
 # ── Model routing (save tokens: cheap model for chat, capable for reports) ──
 CHAT_MODEL    = os.getenv('CHAT_MODEL', 'claude-haiku-4-5-20251001')   # quick voice/chat
@@ -91,6 +98,9 @@ def index():
 # English text back (JARVIS reasons in English). Use a non-".en" model for this.
 WHISPER_MODEL_NAME = os.getenv('WHISPER_MODEL', 'small')
 WHISPER_TASK = os.getenv('WHISPER_TASK', 'translate')  # 'translate' → English; 'transcribe' → same language
+# Force the source language: auto-detect kept mis-hearing Indian English as
+# Spanish/etc ("Arroz", "Zomanto"). Set WHISPER_LANG=auto to restore detection.
+WHISPER_LANG = os.getenv('WHISPER_LANG', 'en')
 _whisper_model = None
 
 def get_whisper():
@@ -113,7 +123,9 @@ def transcribe():
         f.save(tmp.name)
         tmp.close()
         model = get_whisper()
-        segments, _info = model.transcribe(tmp.name, beam_size=1, vad_filter=True, task=WHISPER_TASK)
+        segments, _info = model.transcribe(
+            tmp.name, beam_size=5, vad_filter=True, task=WHISPER_TASK,
+            language=None if WHISPER_LANG == 'auto' else WHISPER_LANG)
         text = ''.join(seg.text for seg in segments).strip()
         return jsonify({'text': text})
     except Exception as ex:
@@ -123,6 +135,38 @@ def transcribe():
             os.remove(tmp.name)
         except OSError:
             pass
+
+# ─── Neural TTS — Kokoro sidecar (human British voice) ─────
+# kokoro-onnx needs Python ≥3.10; this server runs on 3.9, so the model lives
+# in a sidecar process under .tts-venv and we proxy to it.
+TTS_PORT = int(os.getenv('TTS_PORT', '3001'))
+_tts_proc = None
+
+def start_tts_sidecar():
+    global _tts_proc
+    here = os.path.dirname(os.path.abspath(__file__))
+    venv_py = os.path.join(here, '.tts-venv', 'bin', 'python')
+    model = os.path.join(here, 'models', 'kokoro-v1.0.onnx')
+    if not (os.path.exists(venv_py) and os.path.exists(model)):
+        print('⚠️  Kokoro TTS not installed — falling back to browser voice')
+        return
+    import subprocess
+    _tts_proc = subprocess.Popen([venv_py, os.path.join(here, 'tts_server.py')], cwd=here)
+    import atexit
+    atexit.register(lambda: _tts_proc and _tts_proc.terminate())
+
+@app.route('/api/tts', methods=['POST'])
+def tts_proxy():
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f'http://127.0.0.1:{TTS_PORT}/tts',
+            data=json.dumps(request.get_json(force=True) or {}).encode(),
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return Response(r.read(), mimetype='audio/wav')
+    except Exception as ex:
+        return jsonify({'error': str(ex)}), 503
 
 # ─── Equity Report — real data, no LLM ─────────────────────
 _report_cache = {}
@@ -146,8 +190,11 @@ def _cache_get(sym):
 def _detect_horizon(message):
     """Short-term (6-12mo technical) vs long-term (DCF)."""
     m = (message or '').lower()
-    if re.search(r'\b(short.?term|short term|6.?month|six month|near.?term|swing|trade|trading|'
-                 r'technical|momentum|entry|breakout|stop.?loss|next (6|six|twelve|12) month)\b', m):
+    # NOTE: bare "trade/trading/entry" removed — "what is it trading at" was
+    # misrouting plain analysis requests to the technical note (Swiggy, 2026-08-07).
+    if re.search(r'\b(short.?term|short term|6.?month|six month|near.?term|swing|day.?trade|'
+                 r'technical|momentum|entry (point|level)|breakout|stop.?loss|'
+                 r'next (6|six|twelve|12) month)\b', m):
         return 'short'
     return 'long'
 
@@ -168,6 +215,101 @@ def _claude_narrative(d, a, horizon='long'):
         return R._parse_narrative(res.content[0].text)
     except Exception:
         return None  # graceful fallback → deterministic report
+
+JEV_FEEDBACK_ROUNDS = int(os.getenv('JEV_FEEDBACK_ROUNDS', '1'))
+
+def _claude_revise(d, a, narrative, jev, horizon='long'):
+    """Round 2: Claude re-reads its own answer plus Jev's feedback and returns a revised narrative."""
+    import report_engine as R
+    if not client:
+        return None
+    try:
+        system, user = R.build_revision_prompt(d, a, narrative, jev, horizon)
+        res = client.messages.create(model=REPORT_MODEL, max_tokens=4096, system=system,
+                                     messages=[{'role': 'user', 'content': user}])
+        return R._parse_narrative(res.content[0].text)
+    except Exception:
+        return None
+
+def _jev_loop(d, a, narrative, horizon='long'):
+    """Claude → Jev → Claude revises with Jev's feedback → Jev judges again.
+    Returns (final_narrative, final_jev, trail). trail = plain-English steps."""
+    import jev_judge
+    import report_engine as R
+    fv, detail = R.dcf_for_jev(d, a, narrative)
+    dq = R.data_quality_for(d)
+    trail = []
+    step = 1
+    if narrative:
+        trail.append({'step': step, 'title': 'Claude wrote the first analysis from the live numbers',
+                      'lines': [f"Claude's first verdict: {str(narrative.get('verdict') or '?').upper()}"
+                                + (f" — {narrative['verdict_rationale']}" if narrative.get('verdict_rationale') else "") + "."]})
+        step += 1
+    jev = jev_judge.judge(d, a, narrative, horizon, dcf_fair_value=fv, dcf_detail=detail,
+                          triangulation=R.triangulation_for(d, a, narrative), data_quality=dq)
+    if not jev:
+        trail.append({'step': step, 'title': 'Jev was unavailable',
+                      'lines': ['The verdict falls back to Claude, then to the rule scorecard.']})
+        return narrative, None, trail
+    trail.append({'step': step, 'title': 'JARVIS sent the evidence to Jev', 'lines': jev['sent']})
+    step += 1
+    trail.append({'step': step, 'title': 'JARVIS asked Jev five questions' if narrative else 'JARVIS asked Jev three questions',
+                  'lines': jev['asked']}); step += 1
+    trail.append({'step': step, 'title': 'Jev answered (round 1)', 'lines': jev['received']}); step += 1
+    for rnd in range(JEV_FEEDBACK_ROUNDS):
+        if not narrative:
+            trail.append({'step': step, 'title': 'No feedback round',
+                          'lines': ['Claude did not write a narrative, so there is nothing to revise; Jev\'s round-1 call is final.']})
+            break
+        claude_v = str(narrative.get('verdict') or '').upper() or None
+        fb = jev_judge.feedback_for_claude(jev, claude_v)
+        trail.append({'step': step, 'title': f'JARVIS sent Jev\'s feedback back to Claude (round {rnd + 2})',
+                      'lines': fb.split('\n') + ['Claude was told: revise the analysis, keep every number grounded, return the same structure.']})
+        step += 1
+        revised = _claude_revise(d, a, narrative, jev, horizon)
+        if not revised:
+            trail.append({'step': step, 'title': 'Claude could not revise',
+                          'lines': ['The revision call failed, so the round-1 narrative and Jev call stand.']})
+            break
+        trail.append({'step': step, 'title': 'Claude revised its analysis',
+                      'lines': [f"Revised verdict: {str(revised.get('verdict') or '?').upper()}"
+                                + (f" — {revised['verdict_rationale']}" if revised.get('verdict_rationale') else "")
+                                + (f" (was {claude_v})" if claude_v and claude_v != str(revised.get('verdict') or '').upper() else " (unchanged)") + ".",
+                                f"Revised thesis: {str(revised.get('thesis', ''))[:200]}"]})
+        step += 1
+        fv2, detail2 = R.dcf_for_jev(d, a, revised)
+        jev2 = jev_judge.judge(d, a, revised, horizon, dcf_fair_value=fv2, dcf_detail=detail2,
+                               triangulation=R.triangulation_for(d, a, revised), data_quality=dq)
+        if not jev2:
+            trail.append({'step': step, 'title': 'Jev was unavailable for the re-run',
+                          'lines': ['Round-1 Jev call stands; the revised narrative is still shown.']})
+            narrative = revised
+            break
+        prev, narrative, jev = jev, revised, jev2
+        lines = list(jev['received'])
+        # judge-pleasing guard: confidence up while the two checks on Claude fall
+        drop = max((prev.get(k) or 0) - (jev.get(k) or 0) for k in ('numbers_back_verdict', 'thesis_consistent'))
+        if jev['confidence'] > prev['confidence'] + 0.05 and drop > 0.10:
+            lines.append("Caution: Jev's confidence rose while its checks on Claude fell by more than 10 points. "
+                         "The revision may be written to please the judge rather than the numbers; treat the "
+                         "round-1 spread as the honest one.")
+            jev['judge_pleasing_flag'] = True
+        trail.append({'step': step, 'title': f'JARVIS re-sent the revised analysis to Jev, Jev answered (round {rnd + 2})',
+                      'lines': lines}); step += 1
+    trail.append({'step': step, 'title': 'Final decision',
+                  'lines': [f"Jev's last answer is the final call: {jev['verdict']} "
+                            f"({jev['probabilities'][jev['verdict']]*100:.0f}%, confidence {jev['confidence']:.2f}, "
+                            f"80% interval {jev['interval'][0]} to {jev['interval'][1]}).", jev['sizing']]})
+    jev_judge.log_decision({
+        'ts': datetime.now().isoformat(timespec='seconds'), 'symbol': d['symbol'], 'name': d.get('name'),
+        'horizon': horizon, 'price': d['price'], 'verdict': jev['verdict'], 'confidence': jev['confidence'],
+        'stance': jev['stance'], 'interval': jev['interval'], 'probabilities': jev['probabilities'],
+        'valuation': jev['valuation']['score'], 'downside_risk': jev['downside_risk']['score'],
+        'numbers_back_verdict': jev.get('numbers_back_verdict'), 'thesis_consistent': jev.get('thesis_consistent'),
+        'claude_verdict': (jev.get('agreement') or {}).get('claude'), 'quant_verdict': a.get('verdict'),
+        'triangulation': jev.get('triangulation'), 'judge_pleasing_flag': jev.get('judge_pleasing_flag', False),
+    })
+    return narrative, jev, trail
 
 _EXTRACT_SYS = (
     "The user is an equity investor. Identify the Indian-listed company they refer "
@@ -241,7 +383,8 @@ def analyze_chat():
             return jsonify({'is_analysis': True, 'error': str(ex)})
     horizon = _detect_horizon(message)
     narrative = _claude_narrative(d, a, horizon)
-    r = R.assemble(d, a, narrative, horizon=horizon)
+    narrative, jev, trail = _jev_loop(d, a, narrative, horizon)
+    r = R.assemble(d, a, narrative, horizon=horizon, jev=jev, trail=trail)
     _cache_put(r['symbol'], r)
     val = r.get('validation') or {}
     return jsonify({
@@ -253,6 +396,8 @@ def analyze_chat():
         'speech': r['speech'],        # first 2 + last 2 lines — spoken
         'numbers': r['numbers'],
         'verdict': r['verdict'],
+        'jev': r.get('jev'),          # final decision: distribution, confidence, 80% interval
+        'jev_trail': r.get('jev_trail'),   # plain-English steps: what was sent, what came back
         'data_asof': r.get('data_asof'),
         'validated': val.get('ok'),
         'excel_url': f"/api/stock/download/excel/{r['symbol']}",
@@ -271,12 +416,14 @@ def stock_report():
     except Exception as ex:
         return jsonify({'error': str(ex)}), 502
     narrative = _claude_narrative(d, a)          # hybrid: Claude authors, real data grounds
-    r = R.assemble(d, a, narrative)
+    narrative, jev, trail = _jev_loop(d, a, narrative, 'long')
+    r = R.assemble(d, a, narrative, jev=jev, trail=trail)
     _cache_put(r['symbol'], r)
     val = r.get('validation') or {}
     return jsonify({
         'symbol': r['symbol'], 'name': r['name'], 'summary': r['summary'],
         'verdict': r['verdict'], 'action': r['action'], 'price': r['price'],
+        'jev': r.get('jev'), 'jev_trail': r.get('jev_trail'),
         'price_target': r.get('price_target'),
         'data_asof': r.get('data_asof'), 'data_status': r.get('data_status'),
         'authored_by': r['authored_by'],
@@ -596,8 +743,11 @@ if __name__ == '__main__':
     print('  ⚡  J.A.R.V.I.S.  —  All Systems Online  ⚡')
     print('═' * 55)
     print(f'  🌐  http://localhost:{PORT}')
-    if not ANTHROPIC_KEY:
+    if CLAUDE_BACKEND == 'cli':
+        print('  💳  Claude backend: claude CLI (Max subscription — no API key)')
+    elif not ANTHROPIC_KEY:
         print('  ⚠️   ANTHROPIC_API_KEY missing — copy .env.example → .env')
     print('  🔑  Add Gmail credentials to .env to enable email')
     print('═' * 55 + '\n')
+    start_tts_sidecar()
     app.run(host='0.0.0.0', port=PORT, debug=False)

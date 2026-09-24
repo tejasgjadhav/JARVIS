@@ -12,6 +12,7 @@ import math
 from datetime import datetime
 
 import yfinance as yf
+import jev_judge
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -470,9 +471,9 @@ def analyze(d: dict) -> dict:
 
 
 def numbers_block(d: dict, a: dict, result: dict) -> str:
-    """Compact numbers shown IN the chat (not spoken). Leads with the analyst
-    target; the DCF is shown only when it's a sane cross-check (not for
-    negative-FCF / early-stage names where a plain DCF is misleading)."""
+    """Compact numbers shown IN the chat (not spoken). Leads with the model's
+    DCF intrinsic value — always shown, never calibrated to market price
+    (user directive 2026-08-07); the analyst target is a reference line."""
     price = d["price"]
     fv = (result.get("validation") or {}).get("computed_fair_value")
     tgt = result.get("price_target")
@@ -497,18 +498,20 @@ def numbers_block(d: dict, a: dict, result: dict) -> str:
     fcf_str = "negative (growth-stage)" if (base_fcf is not None and base_fcf < 0) else _fmt_money(base_fcf)
     lines.append(f"Revenue {_fmt_money(d.get('revenue'))} · FCF {fcf_str}")
 
-    # Valuation: analyst target leads; DCF only as a sane cross-check.
+    # Valuation: DCF intrinsic value LEADS and is ALWAYS shown (user directive
+    # 2026-08-07 — the model's answer is the number, never calibrated to market).
+    if fv:
+        lines.append(f"**DCF intrinsic value ₹{fv:,.0f} ({(fv/price-1)*100:+.0f}%)**")
     if tgt:
-        lines.append(f"Analyst fair value ₹{tgt:,.0f} ({(tgt/price-1)*100:+.0f}%)")
-    dcf_reliable = (fv and base_fcf and base_fcf > 0 and 0.5 * price <= fv <= 2.0 * price)
-    if dcf_reliable:
-        lines.append(f"DCF cross-check ₹{fv:,.0f} ({(fv/price-1)*100:+.0f}%)")
-    elif not tgt and fv:
-        lines.append(f"DCF (indicative) ₹{fv:,.0f}")
-    if not tgt and not dcf_reliable and base_fcf is not None and base_fcf < 0:
-        lines.append("_DCF omitted — negative FCF; valuation is judgement-led._")
+        lines.append(f"Analyst reference ₹{tgt:,.0f} ({(tgt/price-1)*100:+.0f}%)")
 
     lines.append(f"**Verdict: {result['verdict']}**")
+    j = a.get("jev")
+    if j:
+        lines.append(jev_judge.summary_line(j))
+        lines.append(jev_judge.distribution_line(j))
+    else:
+        lines.append("_Jev unavailable — verdict from Claude/quant chain_")
     validated = (result.get("validation") or {}).get("ok")
     lines.append(f"_Data as-of {result.get('data_asof')} · "
                  f"{'✅ calcs validated' if validated else '⚠ validation flagged'} · "
@@ -540,15 +543,24 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
 
     thesis = (n.get("thesis") or a["action"]).strip()
     thesis_first = thesis.split(". ")[0].rstrip(".") + "."
-    rec = (n.get("recommendation") or a["action"]).strip()
+    rec = recommendation_text(a, narrative)
     rec_last = rec.split(". ")[-1].strip().rstrip(".") + "."
-    rationale = (n.get("verdict_rationale") or "").strip()
+    rationale = verdict_rationale(a, narrative)
+    j = a.get("jev")
 
-    # ── Spoken: 2 lines about the company (intro + thesis) + final recommendation ──
+    # ── Spoken: VERDICT + Jev confidence + DCF intrinsic value FIRST (never lost
+    # if speech is cut short by an interrupt), then the thesis line ──
+    _fv_spoken = (result.get("validation") or {}).get("computed_fair_value")
     intro_line = f"{d['name']}, {sector}." if sector else f"{d['name']}."
-    final_line = f"Final recommendation: {verdict}" + (f", {rationale}" if rationale else "") + \
-                 (f". Twelve-month target {tgt:,.0f} rupees." if tgt else ".")
-    speech = " ".join([intro_line, thesis_first, final_line])
+    final_line = f"Final recommendation: {verdict}" + (f", {rationale}" if rationale else "") + "."
+    if j:
+        final_line += " " + jev_judge.speech_fragment(j)
+    if _fv_spoken:
+        final_line += (f" DCF intrinsic value {_fv_spoken:,.0f} rupees, "
+                       f"against a market price of {d['price']:,.0f}.")
+    elif tgt:
+        final_line += f" Twelve-month target {tgt:,.0f} rupees."
+    speech = " ".join([intro_line, final_line, thesis_first])
 
     price = d["price"]
     pct = lambda x: f"{x*100:.1f}%" if x is not None else "—"
@@ -606,7 +618,8 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
         v.append(f"Assumptions: growth {' / '.join(pct(x) for x in g)}")
         v.append(f"EBIT margin path: {' / '.join(pct(x) for x in em)}")
         v.append(f"tax {pct(asmp.get('tax_rate'))} · capex {pct(asmp.get('capex_pct'))} · D&A {pct(asmp.get('da_pct'))} · "
-                 f"ΔNWC {pct(asmp.get('nwc_pct'))} · terminal {pct(asmp.get('terminal_growth'))}")
+                 f"ΔNWC {pct(asmp.get('nwc_pct'))} · terminal {pct(asmp.get('terminal_growth'))} "
+                 f"(steady-state margin {pct(asmp.get('terminal_margin'))} · ROIC {pct(asmp.get('terminal_roic'))})")
         sch = dcf.get("schedule", [])
         if sch:
             fyl = fy_labels(d, len(sch))
@@ -701,20 +714,33 @@ def compose_analysis(d: dict, a: dict, narrative, result: dict):
             cl.append(f"**Key fundamental difference:** {n['divergence_factor']}")
         p.append("\n".join(cl))
 
-    # ── RECOMMENDATION — LAST, after analysing ──
-    rblock = [f"**Recommendation: {verdict}**", rec]
+    # ── RECOMMENDATION — LAST, after analysing. Jev makes the final call. ──
+    rblock = [f"**Recommendation: {verdict}**" + (" · _final decision by Jev_" if j else ""), rec]
+    if j:
+        rblock.append(jev_judge.summary_line(j))
+        rblock.append("Distribution: " + jev_judge.distribution_line(j))
+        rblock.append(jev_judge.support_line(j))
+        if j.get("method_check"):
+            rblock.append(j["method_check"])
+        if j.get("sizing"):
+            rblock.append(f"**{j['sizing']}**")
+        ag = jev_judge.agreement_line(j)
+        if ag:
+            rblock.append(ag)
     fvc = (result.get("validation") or {}).get("computed_fair_value")
-    dcf_reliable = fvc and d.get("fcf") and d["fcf"] > 0 and 0.5 * price <= fvc <= 2.0 * price
     tail = []
+    if fvc:
+        tail.append(f"DCF intrinsic value ₹{fvc:,.0f} ({(fvc/price-1)*100:+.0f}%)")
     if tgt:
-        tail.append(f"Analyst target ₹{tgt:,.0f} ({(tgt/price-1)*100:+.0f}%)")
-    if dcf_reliable:
-        tail.append(f"DCF fair value ₹{fvc:,.0f} ({(fvc/price-1)*100:+.0f}%)")
+        tail.append(f"Analyst reference ₹{tgt:,.0f} ({(tgt/price-1)*100:+.0f}%)")
     if tail:
         rblock.append(" · ".join(tail))
     validated = (result.get("validation") or {}).get("ok")
     rblock.append(f"_{'✅ calcs validated by Python layer' if validated else '⚠ validation flagged'} · Excel + PDF downloading…_")
     p.append("\n".join(rblock))
+    tm = trail_markdown(a.get("jev_trail"))
+    if tm:
+        p.append(tm)
 
     return "\n\n".join(p), speech
 
@@ -764,21 +790,53 @@ def data_recency(d: dict) -> dict:
 
 
 def final_verdict(a: dict, narrative=None) -> str:
-    """Claude's call is the headline; quant scorecard is the fallback."""
+    """Jev's call is the headline (final decision-maker); Claude's call is the
+    fallback when Jev is unavailable; the quant scorecard is the last resort."""
+    j = a.get("jev")
+    if j and j.get("verdict") in ("BUY", "ACCUMULATE", "HOLD", "REDUCE", "SELL"):
+        return j["verdict"]
     v = (narrative or {}).get("verdict")
     if v and str(v).upper() in ("BUY", "ACCUMULATE", "HOLD", "REDUCE", "SELL"):
         return str(v).upper()
     return a["verdict"]
 
 
+def verdict_rationale(a: dict, narrative=None) -> str:
+    """Claude's one-clause rationale, but only when Claude's call matches the
+    final verdict. When Jev overrides Claude, Claude's clause would argue for
+    a different call, so the standard action text for the final verdict is
+    used instead."""
+    verdict = final_verdict(a, narrative)
+    n = narrative or {}
+    claude_v = str(n.get("verdict") or "").upper()
+    if n.get("verdict_rationale") and claude_v == verdict:
+        return str(n["verdict_rationale"]).strip()
+    if verdict == a.get("verdict"):
+        return a["action"]
+    return jev_judge.ACTION_TEXT.get(verdict, a["action"])
+
+
+def recommendation_text(a: dict, narrative=None) -> str:
+    """Claude's two-sentence recommendation, unless Jev overrode Claude's call.
+    Then Claude's paragraph would argue for the wrong verdict, so it is
+    replaced by the action text plus a one-line note on the override."""
+    n = narrative or {}
+    verdict = final_verdict(a, narrative)
+    j = a.get("jev")
+    claude_v = str(n.get("verdict") or "").upper()
+    if j and claude_v and claude_v != verdict:
+        note = f"Jev overrides Claude's {claude_v} call"
+        if j.get("numbers_back_verdict") is not None:
+            note += f"; the figures justify Claude's call at only {j['numbers_back_verdict']*100:.0f}%"
+        return f"{jev_judge.ACTION_TEXT.get(verdict, a['action'])}. {note}."
+    return (n.get("recommendation") or jev_judge.ACTION_TEXT.get(verdict) or a["action"]).strip()
+
+
 def two_line_summary(d: dict, a: dict, narrative=None) -> str:
     """Exactly two lines for voice/chat: company + final call with short rationale."""
     intro = f"{d['name']} — {d['industry']} ({d['sector']})."
     verdict = final_verdict(a, narrative)
-    rationale = (narrative or {}).get("verdict_rationale")
-    if not rationale and narrative and narrative.get("recommendation"):
-        rationale = narrative["recommendation"].split(". ")[0]
-    rationale = (rationale or a["action"]).strip().rstrip(".")
+    rationale = verdict_rationale(a, narrative).strip().rstrip(".")
     # keep the spoken line tight
     if len(rationale) > 90:
         rationale = rationale[:87].rsplit(" ", 1)[0] + "…"
@@ -825,6 +883,8 @@ def default_assumptions(d: dict) -> dict:
         "nwc_pct": 0.02,
         "wacc": 0.12,
         "terminal_growth": 0.05,
+        "terminal_margin": ebit_margin[-1],
+        "terminal_roic": 0.15,
         "net_debt_cr": round(net_debt_cr, 2),
         "shares_cr": round(shares_cr, 4) if shares_cr else 1.0,
         "price": d["price"],
@@ -857,7 +917,9 @@ def merge_assumptions(base: dict, claude: dict) -> dict:
     for key, lo, hi in [("tax_rate", 0.10, 0.40),
                         ("capex_pct", 0.0, 0.25), ("da_pct", 0.0, 0.20),
                         ("nwc_pct", -0.10, 0.20), ("wacc", 0.07, 0.20),
-                        ("terminal_growth", 0.0, 0.07)]:
+                        ("terminal_growth", 0.0, 0.07),
+                        ("terminal_margin", 0.02, 0.55),
+                        ("terminal_roic", 0.08, 0.40)]:
         if claude.get(key) is not None:
             v = clamp(claude[key], lo, hi)
             if v is not None:
@@ -865,6 +927,14 @@ def merge_assumptions(base: dict, claude: dict) -> dict:
     # keep terminal_growth strictly below wacc for DCF stability
     if out["terminal_growth"] >= out["wacc"] - 0.01:
         out["terminal_growth"] = round(out["wacc"] - 0.03, 4)
+    # steady-state terminal economics: default to the Yr-5 margin / WACC+3% if Claude omitted them
+    m_list = out["ebit_margin"] if isinstance(out["ebit_margin"], list) else [out["ebit_margin"]]
+    if claude.get("terminal_margin") is None:
+        out["terminal_margin"] = m_list[-1]
+    if claude.get("terminal_roic") is None:
+        out["terminal_roic"] = round(out["wacc"] + 0.03, 4)
+    if out["terminal_roic"] <= out["terminal_growth"] + 0.02:
+        out["terminal_roic"] = round(out["terminal_growth"] + 0.02, 4)
     return out
 
 
@@ -892,7 +962,13 @@ def python_dcf(asmp: dict) -> dict:
                          "da": da, "capex": capex, "dnwc": dnwc, "fcf": fcf,
                          "df": df, "pv_fcf": fcf * df})
         rev_prev, fcf_last, df_last = rev, fcf, df
-    tv = fcf_last * (1 + tg) / (wacc - tg)
+    # Terminal value on NORMALIZED steady-state economics — never raw Yr-5 FCF,
+    # which would lock growth-phase capex/NWC into the perpetuity and depress value.
+    t_margin = asmp.get("terminal_margin") or margins[-1]
+    t_roic = asmp.get("terminal_roic") or (wacc + 0.03)
+    nopat_t = rev_prev * (1 + tg) * t_margin * (1 - asmp["tax_rate"])
+    fcf_t = nopat_t * (1 - tg / t_roic)
+    tv = fcf_t / (wacc - tg)
     pv_tv = tv * df_last
     ev = pv_sum + pv_tv
     equity = ev - asmp["net_debt_cr"]
@@ -901,6 +977,23 @@ def python_dcf(asmp: dict) -> dict:
     return {"ev": ev, "equity": equity, "fair_value": fv, "upside": upside,
             "schedule": schedule, "pv_explicit": pv_sum, "terminal_value": tv,
             "pv_terminal": pv_tv}
+
+
+def _jev_rows(a: dict):
+    """Cover-sheet rows describing Jev's final decision (empty when unavailable)."""
+    j = a.get("jev")
+    if not j:
+        return [("Jev decision", "unavailable — verdict from Claude/quant chain")]
+    lo, hi = j["interval"]
+    return [
+        ("Jev decision", f"{j['verdict']} ({j['probabilities'][j['verdict']]*100:.0f}%)"),
+        ("Jev confidence", f"{j['confidence']:.2f} ({j['conviction']})"),
+        (f"Jev {int(j['interval_mass']*100)}% interval", f"{lo} to {hi}" if lo != hi else lo),
+        ("Jev distribution", jev_judge.distribution_line(j)),
+        ("Jev valuation / risk", jev_judge.support_line(j)),
+        ("Jev sizing", j.get("sizing") or "—"),
+        ("Jev method check", j.get("method_check") or "—"),
+    ]
 
 
 def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
@@ -936,7 +1029,8 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
         ("Current Price", f"₹{d['price']:,.2f}"),
         ("Market Cap", _fmt_money(d.get("market_cap"))),
         ("Recommendation", final_verdict(a, narrative)),
-        ("Action", (narrative or {}).get("verdict_rationale") or a["action"]),
+        ("Action", verdict_rationale(a, narrative)),
+    ] + _jev_rows(a) + [
         ("Report Date", datetime.now().strftime("%d %b %Y")),
     ]
     r = 3
@@ -1081,6 +1175,20 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
     msc = wa.cell(18, 2, src.get("ebit_margin", "trailing margin + operating leverage path"))
     msc.font = Font(italic=True, color=GREY, size=9)
     wa.merge_cells("B18:F18")
+    # steady-state terminal drivers → B19 (margin), B20 (ROIC) — feed the MODEL terminal value
+    for _row, _lbl, _key, _dflt, _srcdflt in (
+            (19, "Terminal EBIT margin (steady state)", "terminal_margin", _m_list[-1],
+             "steady-state margin at maturity"),
+            (20, "Terminal ROIC (steady state)", "terminal_roic", 0.15,
+             "return on incremental capital ≈ WACC + moat spread")):
+        wa.cell(_row, 1, _lbl).font = Font(bold=True, color=NAVY)
+        c = wa.cell(_row, 2, asmp.get(_key, _dflt))
+        c.number_format = pct
+        c.fill = PatternFill("solid", fgColor="FFF7E0")
+        c.border = border
+        sc = wa.cell(_row, 3, src.get(_key, _srcdflt))
+        sc.font = Font(italic=True, color=GREY, size=9)
+        sc.alignment = Alignment(wrap_text=True, vertical="top")
     wa.column_dimensions["A"].width = 26
     wa.column_dimensions["B"].width = 13
     wa.column_dimensions["C"].width = 46
@@ -1125,7 +1233,10 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
     # Valuation block
     val = [
         ("Sum PV (explicit)", "=SUM(B11:F11)", num),                                          # B13
-        ("Terminal value", "=F9*(1+ASSUMPTIONS!$B$10)/(ASSUMPTIONS!$B$9-ASSUMPTIONS!$B$10)", num),  # B14
+        ("Terminal value",                                                                    # B14
+         "=F3*(1+ASSUMPTIONS!$B$10)*ASSUMPTIONS!$B$19*(1-ASSUMPTIONS!$B$5)"
+         "*(1-ASSUMPTIONS!$B$10/ASSUMPTIONS!$B$20)"
+         "/(ASSUMPTIONS!$B$9-ASSUMPTIONS!$B$10)", num),
         ("PV of terminal", "=B14*F10", num),                                                  # B15
         ("Enterprise value", "=B13+B15", num),                                                # B16
         ("Less: net debt", "=ASSUMPTIONS!$B$11", num),                                        # B17
@@ -1428,7 +1539,7 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
             section("CATALYSTS", narrative["catalysts"])
         if narrative.get("risks"):
             section("KEY RISKS", narrative["risks"])
-        section("RECOMMENDATION RATIONALE", narrative.get("recommendation", a["action"]))
+        section("RECOMMENDATION RATIONALE", recommendation_text(a, narrative))
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1438,6 +1549,37 @@ def build_excel(d: dict, a: dict, narrative=None, assumptions=None) -> bytes:
 # ═══════════════════════════════════════════════════════════
 #  4. INSTITUTIONAL PDF
 # ═══════════════════════════════════════════════════════════
+def _jev_pdf(story, a: dict, body):
+    """Append Jev's decision paragraph to a PDF story."""
+    j = a.get("jev")
+    if not j:
+        story.append(Paragraph("<i>Jev unavailable — verdict from the Claude/quant chain.</i>", body))
+        return
+    lo, hi = j["interval"]
+    rng = f"{lo} to {hi}" if lo != hi else lo
+    story.append(Paragraph(
+        f"<b>Jev final decision: {j['verdict']}</b> ({j['probabilities'][j['verdict']]*100:.0f}%) · "
+        f"confidence {j['confidence']:.2f} ({j['conviction']}) · "
+        f"{int(j['interval_mass']*100)}% credible interval {rng}", body))
+    story.append(Paragraph("Distribution: " + jev_judge.distribution_line(j), body))
+    story.append(Paragraph(jev_judge.support_line(j), body))
+    if j.get("method_check"):
+        story.append(Paragraph(j["method_check"], body))
+    if j.get("sizing"):
+        story.append(Paragraph(f"<b>{j['sizing']}</b>", body))
+    ag = jev_judge.agreement_line(j)
+    if ag:
+        story.append(Paragraph(ag, body))
+    trail = a.get("jev_trail") or []
+    if trail:
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("<b>How the decision was made, step by step</b>", body))
+        for st in trail:
+            story.append(Paragraph(f"<b>Step {st['step']}. {st['title']}</b>", body))
+            for line in st.get("lines", []):
+                story.append(Paragraph(f"•&nbsp; {line}", body))
+
+
 def build_pdf(d: dict, a: dict, narrative=None) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -1634,11 +1776,14 @@ def build_pdf(d: dict, a: dict, narrative=None) -> bytes:
             story.append(Paragraph(f"<b>Key fundamental difference:</b> {narrative['divergence_factor']}", body))
 
     story.append(Paragraph("Recommendation", hh))
-    rec_text = narrative.get("recommendation") if narrative else a["action"]
+    rec_text = recommendation_text(a, narrative)
     story.append(Paragraph(f"<b>{verdict}.</b> {rec_text}", body))
+    _jev_pdf(story, a, body)
 
     story.append(Spacer(1, 10))
     src = "Figures: Yahoo Finance (live). Narrative: Claude." if narrative else "Data: Yahoo Finance (live)."
+    if a.get("jev"):
+        src += " Final decision: Jev (TypeSafe System One)."
     story.append(Paragraph(
         f"<i>{src} Generated by J.A.R.V.I.S. Report Engine. "
         "Automated research, not personalised investment advice.</i>",
@@ -1803,11 +1948,15 @@ def compose_short(d: dict, a: dict, narrative, result: dict):
     sector = d.get("industry") or d.get("sector") or ""
     thesis = (n.get("thesis") or "Short-term technical view.").strip()
     thesis_first = thesis.split(". ")[0].rstrip(".") + "."
-    rationale = (n.get("verdict_rationale") or "").strip()
+    rationale = verdict_rationale(a, narrative)
+    j = a.get("jev")
     intro = f"{d['name']}, {sector}." if sector else f"{d['name']}."
     final_line = f"Short-term call: {verdict}" + (f", {rationale}" if rationale else "") + \
                  (f". Target {tgt:,.0f} rupees." if tgt else ".")
-    speech = " ".join([intro, thesis_first, final_line])
+    if j:
+        final_line += " " + jev_judge.speech_fragment(j)
+    # verdict FIRST so an interrupted speech never loses the conclusion
+    speech = " ".join([intro, final_line, thesis_first])
 
     pn = lambda x: f"₹{x:,.0f}" if x is not None else "—"
     p = [f"**{d['name']} ({d['symbol']})** · ₹{price:,.0f}  ·  _Short-term (6–12 mo) · technical view_"]
@@ -1841,8 +1990,23 @@ def compose_short(d: dict, a: dict, narrative, result: dict):
         if n.get("vs_consensus"): cl.append(n["vs_consensus"])
         p.append("\n".join(cl))
     p.append("_📊 Technical summary in the downloaded Excel + PDF · No DCF (short-term horizon)._")
-    rec = (n.get("recommendation") or a["action"]).strip()
-    p.append(f"**Recommendation: {verdict}**\n{rec}")
+    rec = recommendation_text(a, narrative)
+    rb = [f"**Recommendation: {verdict}**" + (" · _final decision by Jev_" if j else ""), rec]
+    if j:
+        rb.append(jev_judge.summary_line(j))
+        rb.append("Distribution: " + jev_judge.distribution_line(j))
+        rb.append(jev_judge.support_line(j))
+        if j.get("method_check"):
+            rb.append(j["method_check"])
+        if j.get("sizing"):
+            rb.append(f"**{j['sizing']}**")
+        ag = jev_judge.agreement_line(j)
+        if ag:
+            rb.append(ag)
+    p.append("\n".join(rb))
+    tm = trail_markdown(a.get("jev_trail"))
+    if tm:
+        p.append(tm)
     return "\n\n".join(p), speech
 
 
@@ -1865,8 +2029,8 @@ def build_excel_short(d: dict, a: dict, narrative) -> bytes:
     ws["A1"].fill = hf; ws["A1"].font = Font(color="FFFFFF", bold=True, size=14)
     ws.merge_cells("A1:D1")
     rows = [("Company", d["name"]), ("Symbol", d["symbol"]), ("Price (₹)", f"{d['price']:,.2f}"),
-            ("Call", verdict), ("Target (₹)", f"{n.get('price_target'):,.0f}" if n.get("price_target") else "—"),
-            ("Report Date", datetime.now().strftime("%d %b %Y"))]
+            ("Call", verdict), ("Target (₹)", f"{n.get('price_target'):,.0f}" if n.get("price_target") else "—")] + \
+           _jev_rows(a) + [("Report Date", datetime.now().strftime("%d %b %Y"))]
     r = 3
     for k, v in rows:
         ws.cell(r, 1, k).font = Font(bold=True, color=NAVY)
@@ -1922,7 +2086,7 @@ def build_excel_short(d: dict, a: dict, narrative) -> bytes:
         if n.get("bear_case"): sec("BEAR", n["bear_case"])
         if n.get("catalysts"): sec("CATALYSTS", n["catalysts"])
         if n.get("risks"): sec("RISKS", n["risks"])
-        sec("RECOMMENDATION", n.get("recommendation", a["action"]))
+        sec("RECOMMENDATION", recommendation_text(a, narrative))
         if n.get("vs_consensus"): sec("VS STREET CONSENSUS", n["vs_consensus"])
 
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
@@ -1981,7 +2145,8 @@ def build_pdf_short(d: dict, a: dict, narrative) -> bytes:
                                f"({cons['upside_pct']:+.0f}%). Ours: <b>{verdict}</b>, target ₹{n.get('price_target',0):,.0f}. "
                                f"{n.get('vs_consensus','')}", body))
     story.append(Paragraph("Recommendation", hh))
-    story.append(Paragraph(f"<b>{verdict}.</b> {n.get('recommendation', a['action'])}", body))
+    story.append(Paragraph(f"<b>{verdict}.</b> {recommendation_text(a, narrative)}", body))
+    _jev_pdf(story, a, body)
     story.append(Spacer(1, 10))
     story.append(Paragraph("<i>Data: Yahoo Finance (live). Technical note, not personalised investment advice.</i>",
                  ParagraphStyle("disc", parent=body, fontSize=7.5, textColor=colors.HexColor("#" + GREY))))
@@ -2086,7 +2251,13 @@ def build_prompt(d: dict, a: dict):
         "compression from operating leverage / cost inflation; do NOT use one flat number), "
         "tax_rate (~0.25 for India), capex_pct, da_pct, nwc_pct (incremental NWC as % of "
         "revenue change), wacc (discount rate reflecting risk), terminal_growth "
-        "(long-run, below wacc, ~0.03-0.05).\n"
+        "(long-run, below wacc, ~0.03-0.05), terminal_margin (the STEADY-STATE EBIT margin "
+        "the business earns at maturity — for a company whose margins are still ramping this "
+        "is usually ABOVE the Yr-5 margin; anchor it to mature peers / unit economics, never "
+        "just repeat Yr-5), terminal_roic (steady-state return on incremental capital — "
+        "typically wacc+0.02 to wacc+0.06 for moaty franchises, ≈wacc for commodity "
+        "businesses; the terminal value reinvests g/ROIC of NOPAT, so growth-phase capex "
+        "does NOT carry into the perpetuity).\n"
         "- wacc_build: object showing how you derived WACC (like an IB memo): "
         "rf (risk-free, India 10yr G-sec ~0.07), erp (equity risk premium ~0.06-0.08), "
         "beta, cost_of_equity, cost_of_debt (after-tax), equity_weight, debt_weight, "
@@ -2096,7 +2267,8 @@ def build_prompt(d: dict, a: dict):
         "24% vs 22% trailing on operating leverage', 'WACC 12.5% — high ERP for India').\n"
         "- sources: object giving a one-line SOURCE/BASIS for EACH driver (these populate a "
         "Source column in the Excel model). Keys: growth, ebit_margin, tax_rate, capex_pct, "
-        "da_pct, nwc_pct, wacc, terminal_growth. For growth, the source MUST show the triangulation, "
+        "da_pct, nwc_pct, wacc, terminal_growth, terminal_margin, terminal_roic. "
+        "For growth, the source MUST show the triangulation, "
         "e.g. 'Blend: 9% co. CAGR / 13% industry / 12% consensus → 11%'. For ebit_margin cite the "
         "starting (trailing) margin and the expansion/compression logic across the 5 years, "
         "trailing margin + operating-leverage logic. Others: 'India 10yr 7% + Damodaran ERP', "
@@ -2115,16 +2287,115 @@ def build_prompt(d: dict, a: dict):
         '"recommendation":"...",'
         '"price_target":3200,"assumptions":{"growth":[0.09,0.09,0.08,0.08,0.07],'
         '"ebit_margin":[0.22,0.23,0.24,0.245,0.25],"tax_rate":0.25,"capex_pct":0.03,"da_pct":0.03,"nwc_pct":0.02,'
-        '"wacc":0.12,"terminal_growth":0.045},'
+        '"wacc":0.12,"terminal_growth":0.045,"terminal_margin":0.25,"terminal_roic":0.16},'
         '"wacc_build":{"rf":0.07,"erp":0.07,"beta":0.9,"cost_of_equity":0.133,'
         '"cost_of_debt":0.06,"equity_weight":0.9,"debt_weight":0.1,"note":"India 10yr + Damodaran ERP"},'
         '"assumption_log":["Revenue growth fades 9%→7% as base scales",'
         '"EBIT margin 25% on operating leverage","WACC 12% — elevated ERP for India"],'
         '"sources":{"growth":"3yr hist avg + guidance","ebit_margin":"trailing margin + op leverage",'
         '"tax_rate":"India statutory 25%","capex_pct":"3yr capex/revenue","da_pct":"3yr D&A/revenue",'
-        '"nwc_pct":"working-capital trend","wacc":"India 10yr 7% + Damodaran ERP","terminal_growth":"long-run nominal GDP"}}'
+        '"nwc_pct":"working-capital trend","wacc":"India 10yr 7% + Damodaran ERP","terminal_growth":"long-run nominal GDP",'
+        '"terminal_margin":"mature-peer steady-state margin","terminal_roic":"WACC + moat spread for franchise quality"}}'
     )
     return system, user
+
+
+def dcf_for_jev(d: dict, a: dict, narrative=None):
+    """(fair_value, detail) under Claude's assumptions — the number the report
+    leads with — with the full model (assumptions, schedule, EV bridge) so Jev
+    sees everything. Falls back to the rule-based DCF. Briefs Jev BEFORE the
+    Excel is built."""
+    try:
+        if narrative and narrative.get("assumptions"):
+            asmp = merge_assumptions(default_assumptions(d), narrative.get("assumptions"))
+            dcf = python_dcf(asmp)
+            fv = dcf.get("fair_value")
+            if fv and fv > 0:
+                detail = {"assumptions": asmp, "wacc_build": narrative.get("wacc_build"),
+                          "schedule_cr": dcf.get("schedule"),
+                          "pv_explicit_cr": dcf.get("pv_explicit"), "terminal_value_cr": dcf.get("terminal_value"),
+                          "pv_terminal_cr": dcf.get("pv_terminal"), "enterprise_value_cr": dcf.get("ev"),
+                          "equity_value_cr": dcf.get("equity")}
+                return fv, detail
+    except Exception:
+        pass
+    return (a.get("dcf") or {}).get("fair_value"), None
+
+
+def dcf_fair_value_for(d: dict, a: dict, narrative=None):
+    return dcf_for_jev(d, a, narrative)[0]
+
+
+def triangulation_for(d: dict, a: dict, narrative=None):
+    """Every valuation method JARVIS has, side by side, for Jev and the report:
+    DCF, peer comps, SOTP, probability-weighted scenarios, Claude's target,
+    street mean (with range). Each with its gap to the current price."""
+    price = d["price"]
+    n = narrative or {}
+    rows = []
+    def add(method, value, extra=None):
+        if value and value > 0:
+            row = {"method": method, "value_inr": round(float(value), 2),
+                   "upside_pct": round((float(value) / price - 1) * 100, 1)}
+            if extra: row.update(extra)
+            rows.append(row)
+    add("DCF (Claude's assumptions)", dcf_fair_value_for(d, a, narrative))
+    comps = n.get("comps") or {}
+    add("Peer comps", comps.get("implied_value_per_share"),
+        {"basis": f"median EV/EBITDA {comps.get('median_ev_ebitda')}x, P/E {comps.get('median_pe')}x",
+         "peers": [pp.get("name") for pp in (comps.get("peers") or [])[:5]]} if comps else None)
+    sotp = n.get("sotp") or {}
+    add("Sum-of-the-parts", sotp.get("implied_value_per_share"),
+        {"segments": [sg.get("segment") for sg in (sotp.get("segments") or [])]} if sotp else None)
+    scen = n.get("scenarios") or {}
+    if scen:
+        ev = sum((scen.get(k) or {}).get("target", 0) * ((scen.get(k) or {}).get("probability") or 0)
+                 for k in ("bull", "base", "bear"))
+        add("Probability-weighted scenarios", ev,
+            {k: {"target": (scen.get(k) or {}).get("target"), "probability": (scen.get(k) or {}).get("probability")}
+             for k in ("bull", "base", "bear")})
+    add("Analyst's 12-month target (Claude)", n.get("price_target"))
+    cons = consensus_summary(d)
+    if cons:
+        add("Street mean target", cons["mean"], {"low": cons.get("low"), "high": cons.get("high"),
+                                                "num_analysts": cons.get("n"), "street_call": cons.get("rec")})
+    return rows
+
+
+def data_quality_for(d: dict):
+    """Recency + price-integrity summary for Jev's state."""
+    rec = data_recency(d)
+    checks = _price_validation_checks(d)
+    return {"financials_asof": rec["asof"], "financials_status": rec["status"], "financials_ok": rec["ok"],
+            "price_check_ok": all(c["pass"] for c in checks),
+            "price_check_detail": "; ".join(c["detail"] for c in checks)}
+
+
+def build_revision_prompt(d: dict, a: dict, narrative: dict, jev: dict, horizon="long"):
+    """Round 2: the original brief plus Jev's feedback and Claude's own round-1
+    answer. Claude must return the same JSON shape, revised."""
+    system, user = (build_prompt_short(d, a) if horizon == "short" else build_prompt(d, a))
+    claude_v = str((narrative or {}).get("verdict") or "").upper() or None
+    user += (
+        "\n\n=== ROUND 2: FEEDBACK ON YOUR FIRST ANSWER ===\n"
+        "Your first answer was:\n" + json.dumps(narrative)[:6000] + "\n\n"
+        + jev_judge.feedback_for_claude(jev, claude_v) +
+        "\n\nRevise your analysis in the light of this feedback. Keep every number grounded in the "
+        "data above. Return the SAME JSON shape as before, complete, with the revised verdict, "
+        "verdict_rationale, thesis, recommendation and assumptions. Return only the JSON."
+    )
+    return system, user
+
+
+def trail_markdown(trail) -> str:
+    if not trail:
+        return ""
+    out = ["**How the decision was made — step by step**"]
+    for st in trail:
+        out.append(f"**Step {st['step']}. {st['title']}**")
+        for line in st.get("lines", []):
+            out.append(f"- {line}")
+    return "\n".join(out)
 
 
 def _parse_narrative(text: str):
@@ -2169,8 +2440,22 @@ def _price_validation_checks(d):
     return checks
 
 
-def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") -> dict:
+def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long",
+             jev=None, trail=None) -> dict:
     recency = data_recency(d)
+    # ── JEV: final decision-maker. Reads the scorecard, DCF, consensus and
+    # Claude's narrative; returns a calibrated distribution over the five calls.
+    # Stored on `a` so every downstream builder (chat, speech, Excel, PDF) sees it
+    # through final_verdict(). None when unavailable → old Claude/quant chain.
+    # server.py runs the Claude↔Jev feedback loop and passes the final round in
+    # as `jev` (+ the plain-English `trail`); a bare call judges once here. ──
+    if jev is None:
+        _fv, _detail = dcf_for_jev(d, a, narrative)
+        jev = jev_judge.judge(d, a, narrative, horizon, dcf_fair_value=_fv, dcf_detail=_detail,
+                              triangulation=triangulation_for(d, a, narrative),
+                              data_quality=data_quality_for(d))
+    a["jev"] = jev
+    a["jev_trail"] = trail or []
     # ── SHORT-TERM: technical note, no DCF ──
     if horizon == "short":
         excel = build_excel_short(d, a, narrative)
@@ -2181,7 +2466,8 @@ def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") ->
             "verdict": final_verdict(a, narrative), "quant_verdict": a["verdict"], "action": a["action"],
             "price": d["price"], "price_target": (narrative or {}).get("price_target"),
             "data_asof": recency["asof"], "data_status": recency["status"],
-            "authored_by": "Claude + live technicals" if narrative else "Technical engine",
+            "authored_by": ("Jev final call · " if a.get("jev") else "") +
+                           ("Claude + live technicals" if narrative else "Technical engine"),
             "levels": (narrative or {}).get("levels"),
             "validation": {"ok": bool(tech) and all(c["pass"] for c in pchecks), "checks": [
                 {"name": "technical indicators computed", "pass": bool(tech),
@@ -2190,6 +2476,7 @@ def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") ->
                  "detail": f"{recency['status']} — as-of {recency['asof']}"},
             ] + pchecks},
             "excel": excel, "pdf": build_pdf_short(d, a, narrative),
+            "jev": a.get("jev"), "jev_trail": a.get("jev_trail"),
         }
         result["numbers"] = ""
         result["analysis"], result["speech"] = compose_short(d, a, narrative, result)
@@ -2220,11 +2507,13 @@ def assemble(d: dict, a: dict, narrative=None, validate=True, horizon="long") ->
         "verdict": final_verdict(a, narrative),
         "quant_verdict": a["verdict"],
         "action": a["action"],
+        "jev": a.get("jev"), "jev_trail": a.get("jev_trail"),
         "price": d["price"],
         "price_target": (narrative or {}).get("price_target"),
         "data_asof": recency["asof"],
         "data_status": recency["status"],
-        "authored_by": "Claude + live data" if narrative else "Quant engine (live data)",
+        "authored_by": ("Jev final call · Claude + live data" if narrative else "Jev final call · quant engine (live data)")
+                       if a.get("jev") else ("Claude + live data" if narrative else "Quant engine (live data)"),
         "assumptions": asmp,
         "validation": validation,
         "excel": excel,
