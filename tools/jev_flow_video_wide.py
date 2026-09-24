@@ -104,13 +104,13 @@ def scene1(t):
     a0 = ease_out((t - 0.9) / 0.4)
     if a0 > 0:
         l = layer(); ld = ImageDraw.Draw(l)
-        ld.text((160, 240), "Jev is TypeSafe's System One model. It does not write. It reads evidence and returns probabilities.",
-                font=F_HOOK2, fill=GOLD + (255,))
+        ld.text((160, 236), "Jev is TypeSafe's System One model. It does not write.", font=F_HOOK2, fill=GOLD + (255,))
+        ld.text((160, 288), "It reads evidence and returns probabilities.", font=F_HOOK2, fill=GOLD + (255,))
         img.alpha_composite(fade(l, a0))
     for i, (head, body) in enumerate(USES):
         a = ease_out((t - 1.5 - i * 0.55) / 0.4)
         if a <= 0: continue
-        y = 360 + i * 120 + int((1 - a) * 20)
+        y = 400 + i * 112 + int((1 - a) * 20)
         l = layer(); ld = ImageDraw.Draw(l)
         ld.ellipse((160, y + 6, 204, y + 50), fill=CLAY + (255,))
         ld.text((173, y + 12), str(i + 1), font=F_CB, fill=WHITE + (255,))
