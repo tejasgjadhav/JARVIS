@@ -15,6 +15,7 @@ CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 src = Path(sys.argv[1])
 out = Path(sys.argv[2]).expanduser()
+AGENT = sys.argv[3] if len(sys.argv) > 3 else "JARVIS"   # public name of the agent in the document
 r = json.loads(src.read_text())
 j = r.get("jev") or {}
 trail = r.get("jev_trail") or []
@@ -32,22 +33,22 @@ ARROW_R = '<div class="arrow-r">&#8594;</div>'
 # ── Page 1: the whole pipeline as blocks ──
 pipeline = "".join([
     box("1. You ask", 'Say or type: "should I buy Eternal?"', "you"), ARROW,
-    box("2. JARVIS fetches live numbers", "Price, P/E, growth, margins, debt, cash flow, 52-week range, moving averages, analyst targets"), ARROW,
+    box("2. The agent fetches live numbers", "Price, P/E, growth, margins, debt, cash flow, 52-week range, moving averages, analyst targets"), ARROW,
     box("3. Rule scorecard", "Seven fixed rules score the numbers. Gives a first, mechanical call."), ARROW,
     box("4. Claude writes the analysis", "Thesis, bull and bear case, risks, catalysts, DCF assumptions, a price target, and its own verdict", "claude"), ARROW,
-    box("5. JARVIS triangulates the value", "Six methods side by side: DCF from Claude's assumptions (never bent toward the market price), peer comps, sum-of-the-parts, probability-weighted scenarios, Claude's target, the street's mean and range. Plus a data-quality check: how fresh the financials are and whether a second source agrees on the price."), ARROW,
+    box("5. The agent triangulates the value", "Six methods side by side: DCF from Claude's assumptions (never bent toward the market price), peer comps, sum-of-the-parts, probability-weighted scenarios, Claude's target, the street's mean and range. Plus a data-quality check: how fresh the financials are and whether a second source agrees on the price."), ARROW,
     box("6. Jev judges (round 1)", "Reads everything from steps 2 to 5. Returns a probability for each of SELL, REDUCE, HOLD, ACCUMULATE, BUY, plus valuation and risk scores and two checks on Claude's note", "jev"), ARROW,
     box("7. Claude gets Jev's feedback", "Sees Jev's probabilities and scores. Revises its analysis. Must keep every number grounded.", "claude"), ARROW,
     box("8. Jev judges again (round 2)", "Reads the revised analysis with the same numbers. Its answer is the FINAL call.", "jev"), ARROW,
-    box("9. Code cross-checks and sizes", "JARVIS checks Jev's call against the majority of the six valuation methods (warns if they contradict), flags a revision that looks written to please the judge, and turns the probability spread into a position size."), ARROW,
+    box("9. Code cross-checks and sizes", "The agent's code checks Jev's call against the majority of the six valuation methods (warns if they contradict), flags a revision that looks written to please the judge, and turns the probability spread into a position size."), ARROW,
     box("10. You get the decision, and it is logged", "Chat, spoken summary, Excel model, PDF note. Each shows the call, the confidence, the 80% interval, the sizing and the step-by-step trail. Every decision is logged so its calibration can be checked against later prices.", "you"),
 ])
 
 # ── Page 2: who does what ──
 roles = f'''
 <div class="row3">
-  {box("JARVIS (the code)", "Fetches data. Runs the rules. Builds the DCF and the Excel. Sends the evidence to Claude and Jev. Assembles the report. It never guesses.", "code")}
-  {box("Claude (the writer)", "Reads the numbers and writes the research note the way an analyst would. Proposes a verdict and a price target. Can be persuasive, so it is not the final word.", "claude")}
+  {box(f"{AGENT} (the code)", "Fetches data. Runs the rules. Builds the DCF and the Excel. Sends the evidence to Claude and Jev. Assembles the report. It never guesses.", "code")}
+  {box("Claude (the LLM that writes)", "Reads the numbers and writes the research note the way an analyst would. Proposes a verdict and a price target. Can be persuasive, so it is not the final word.", "claude")}
   {box("Jev (the judge)", "Reads the numbers AND Claude's note. Does not write. Returns probabilities: how likely each call is, given this evidence. Has no market data of its own, so it judges only what it is shown.", "jev")}
 </div>'''
 
@@ -117,8 +118,8 @@ doc = f'''<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 
 <div class="page">
-<h1>How JARVIS decides: buy, accumulate, hold, reduce or sell</h1>
-<div class="sub">The full workflow with Claude as the writer and Jev as the judge · {date.today().strftime("%d %B %Y")}</div>
+<h1>How Jev helps in equity analysis</h1>
+<div class="sub">The {E(AGENT)} decides buy, accumulate, hold, reduce or sell. Claude writes, Jev judges. · {date.today().strftime("%d %B %Y")}</div>
 {pipeline}
 </div>
 
@@ -138,13 +139,13 @@ doc = f'''<!doctype html><html><head><meta charset="utf-8">
 <h2>What is sent at each step, in plain English</h2>
 <table>
 <tr><th style="width:24%">Step</th><th>What goes out</th><th style="width:30%">What comes back</th></tr>
-<tr><td>2. JARVIS to the market-data feed</td><td>The ticker.</td><td>Price and about 40 financial fields, analyst targets, broker actions, moving averages.</td></tr>
-<tr><td>4. JARVIS to Claude</td><td>Every number from step 2, the rule scorecard, the street consensus, and a brief: write the note as an institutional analyst, propose DCF assumptions, give a verdict and a target.</td><td>The written note, the assumptions, a verdict, a one-line reason, a price target, scenarios, peer comps.</td></tr>
-<tr><td>6. JARVIS to Jev (round 1)</td><td>The company and horizon. All the numbers and the company's business description. The scorecard with each factor's value and signal. The valuation triangulation: all six methods with each one's gap to the price. The DCF detail: assumptions, WACC, the 5-year schedule, the EV-to-equity bridge. The technicals. The street consensus with the rating spread and recent broker moves. The data-quality check. Claude's whole note. Then five questions: the call (a choice of five), valuation weighing every method (0 to 3), downside risk (0 to 3), and the two yes/no checks on Claude.</td><td>A probability for each of the five calls, a confidence, the two scores with their own spreads, and the two yes/no probabilities.</td></tr>
-<tr><td>7. JARVIS to Claude (round 2)</td><td>The original brief and numbers again, Claude's own round-1 answer, and Jev's feedback in words: the verdict and spread, the valuation and risk scores, the two yes/no probabilities, and one instruction: reconcile your call with the numbers or defend it with specific figures; return the same structure, revised.</td><td>The revised note, assumptions, verdict and target.</td></tr>
-<tr><td>8. JARVIS to Jev (round 2)</td><td>Exactly what was sent in round 1, with Claude's revised note and the DCF recomputed from the revised assumptions.</td><td>The final probabilities, confidence, interval and scores.</td></tr>
-<tr><td>9. JARVIS, in code</td><td colspan="2">Checks Jev's call against the six methods and warns if it contradicts most of them. Compares round 2 with round 1: if Jev's confidence rose while its checks on Claude fell, the trail says the revision may be written to please the judge. Turns the spread into sizing: the stance (expected position from −2 SELL to +2 BUY) picks the action, and the width of the 80% interval scales it down when the evidence is divided.</td></tr>
-<tr><td>10. JARVIS to you</td><td colspan="2">The spoken line leads with the call, Jev's confidence and the interval, then the DCF value against the price. The chat, Excel cover and PDF carry the full spread, both scores, the two checks, the method check, the sizing, what Claude and the rules said, and this step-by-step trail. The decision is appended to a log; the calibration tool later compares each call with what the price did.</td></tr>
+<tr><td>2. Agent to the market-data feed</td><td>The ticker.</td><td>Price and about 40 financial fields, analyst targets, broker actions, moving averages.</td></tr>
+<tr><td>4. Agent to Claude</td><td>Every number from step 2, the rule scorecard, the street consensus, and a brief: write the note as an institutional analyst, propose DCF assumptions, give a verdict and a target.</td><td>The written note, the assumptions, a verdict, a one-line reason, a price target, scenarios, peer comps.</td></tr>
+<tr><td>6. Agent to Jev (round 1)</td><td>The company and horizon. All the numbers and the company's business description. The scorecard with each factor's value and signal. The valuation triangulation: all six methods with each one's gap to the price. The DCF detail: assumptions, WACC, the 5-year schedule, the EV-to-equity bridge. The technicals. The street consensus with the rating spread and recent broker moves. The data-quality check. Claude's whole note. Then five questions: the call (a choice of five), valuation weighing every method (0 to 3), downside risk (0 to 3), and the two yes/no checks on Claude.</td><td>A probability for each of the five calls, a confidence, the two scores with their own spreads, and the two yes/no probabilities.</td></tr>
+<tr><td>7. Agent to Claude (round 2)</td><td>The original brief and numbers again, Claude's own round-1 answer, and Jev's feedback in words: the verdict and spread, the valuation and risk scores, the two yes/no probabilities, and one instruction: reconcile your call with the numbers or defend it with specific figures; return the same structure, revised.</td><td>The revised note, assumptions, verdict and target.</td></tr>
+<tr><td>8. Agent to Jev (round 2)</td><td>Exactly what was sent in round 1, with Claude's revised note and the DCF recomputed from the revised assumptions.</td><td>The final probabilities, confidence, interval and scores.</td></tr>
+<tr><td>9. Agent, in code</td><td colspan="2">Checks Jev's call against the six methods and warns if it contradicts most of them. Compares round 2 with round 1: if Jev's confidence rose while its checks on Claude fell, the trail says the revision may be written to please the judge. Turns the spread into sizing: the stance (expected position from −2 SELL to +2 BUY) picks the action, and the width of the 80% interval scales it down when the evidence is divided.</td></tr>
+<tr><td>10. Agent to you</td><td colspan="2">The spoken line leads with the call, Jev's confidence and the interval, then the DCF value against the price. The chat, Excel cover and PDF carry the full spread, both scores, the two checks, the method check, the sizing, what Claude and the rules said, and this step-by-step trail. The decision is appended to a log; the calibration tool later compares each call with what the price did.</td></tr>
 </table>
 <p>Cost and time: each Jev round reads about 3,500 to 6,000 words of evidence and costs well under one US cent. The second Claude round is what adds time, roughly one to two minutes.</p>
 </div>

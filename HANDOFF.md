@@ -1,7 +1,15 @@
 # Handoff — JARVIS × Jev final-decision integration
 _Updated: 2026-09-24 (later) by Claude Code (Fable 5.1)_
 
-## LinkedIn post (2026-09-24) — READY, NOT POSTED
+## LinkedIn post (2026-09-24, renamed) — READY, NOT POSTED
+He renamed the public assets: "Equity Analyst Agent (LLM: Claude)", angle "How Jev helps in
+equity analysis", Eternal example. New files in ~/Downloads: `Equity_Analyst_Agent_Jev_Workflow.pdf`
+(7pp, zero "JARVIS" mentions; generator takes the agent name as argv[3] and the trail JSON copy
+`eternal3_agent.json` in the session scratchpad), `Equity_Analyst_Agent_Jev_Flow.mp4` + `_still.png`,
+`Equity_Analyst_Agent_Jev_LinkedIn_post.txt`. The JARVIS-named files from earlier are superseded.
+Code and repo keep the JARVIS name. Still blocked on Chrome connection for posting.
+
+## (earlier) LinkedIn post (2026-09-24) — superseded by the renamed set above
 Assets in ~/Downloads: `JARVIS_Jev_Workflow.pdf` (7pp, final Eternal run: HOLD 37%, conf 0.20,
 interval SELL–ACCUMULATE, DCF ₹91 vs comps ₹448), `JARVIS_Jev_Flow.mp4` (8s animated
 infographic, 1080x1350, H.264) + `_still.png`, `JARVIS_Jev_LinkedIn_post.txt` (voice-passed).
