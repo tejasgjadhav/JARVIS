@@ -9,7 +9,8 @@ Four scenes with crossfades:
   4. Closing card: the takeaway, byline, disclaimer.
 Prices and targets withheld (covered-person rule). Disclaimer on every scene.
 
-Usage: python3 tools/jev_flow_video_wide.py ~/Downloads/Equity_Analyst_Agent_Jev_Explainer_16x9.mp4
+Usage: python3 tools/jev_flow_video_wide.py OUT.mp4 [pace, default 1.6] [core]
+  core = flow + results only, no opening or closing slide
 """
 import math
 import subprocess
@@ -50,10 +51,11 @@ STEPS = [
 PROBS = [("SELL", 0.37), ("REDUCE", 0.63), ("HOLD", 0.00), ("ACCUMULATE", 0.00), ("BUY", 0.00)]
 
 # ── timeline ──
-S1 = 0.0; S1_END = 5.6
-S2 = S1_END; STEP0 = S2 + 1.0; STEP_DT = 0.75; ENTER = 0.4; S2_END = STEP0 + 8 * STEP_DT + 0.6
-S3 = S2_END; S3_END = S3 + 6.0
-S4 = S3_END; T_END = S4 + 4.0
+CORE = len(sys.argv) > 3 and sys.argv[3] == "core"   # flow + results only (no opening or closing slide)
+S1 = 0.0; S1_END = 0.0 if CORE else 5.6
+S2 = S1_END; STEP0 = S2 + 1.0; STEP_DT = 0.75; ENTER = 0.4; S2_END = STEP0 + 8 * STEP_DT + (1.6 if CORE else 0.6)
+S3 = S2_END; S3_END = S3 + (7.5 if CORE else 6.0)
+S4 = S3_END; T_END = S3_END if CORE else S4 + 4.0
 XF = 0.5  # crossfade
 
 
@@ -267,6 +269,10 @@ def scene4(t):
 
 
 def frame(t):
+    if CORE:
+        if t < S3 - XF: return scene2(t).convert("RGB")
+        if t < S3:      return Image.blend(scene2(t).convert("RGB"), scene3(t).convert("RGB"), (t - (S3 - XF)) / XF)
+        return scene3(t).convert("RGB")
     if t < S2 - XF: return scene1(t).convert("RGB")
     if t < S2:      return Image.blend(scene1(t).convert("RGB"), scene2(t).convert("RGB"), (t - (S2 - XF)) / XF)
     if t < S3 - XF: return scene2(t).convert("RGB")
@@ -276,14 +282,13 @@ def frame(t):
     return scene4(t).convert("RGB")
 
 
+SLOW = float(sys.argv[2]) if len(sys.argv) > 2 else 1.6   # 1.0 = original pace; 1.6 = 60% slower
 tmp = OUT.with_name("_raw_" + OUT.name)
 vw = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
-for f in range(int(T_END * FPS)):
-    vw.write(cv2.cvtColor(np.array(frame(f / FPS)), cv2.COLOR_RGB2BGR))
+for f in range(int(T_END * SLOW * FPS)):
+    vw.write(cv2.cvtColor(np.array(frame(f / FPS / SLOW)), cv2.COLOR_RGB2BGR))
 vw.release()
-for name, tt in (("s1", 3.5), ("s2", S2_END - 0.7), ("s3", S3_END - 0.7), ("s4", T_END - 0.3)):
-    frame(tt).save(OUT.with_name(f"{OUT.stem}_{name}.png"))
 subprocess.run([FF, "-y", "-loglevel", "error", "-i", str(tmp), "-c:v", "libx264", "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart", str(OUT)], check=True)
 tmp.unlink()
-print(f"wrote {OUT} ({OUT.stat().st_size:,} bytes, {T_END:.1f}s, {W}x{H})")
+print(f"wrote {OUT} ({OUT.stat().st_size:,} bytes, {T_END * SLOW:.1f}s, {W}x{H}, pace x{1/SLOW:.2f})")
