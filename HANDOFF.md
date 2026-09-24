@@ -1,6 +1,15 @@
 # Handoff — JARVIS × Jev final-decision integration
 _Updated: 2026-09-24 (later) by Claude Code (Fable 5.1)_
 
+## LinkedIn post (2026-09-24) — READY, NOT POSTED
+Assets in ~/Downloads: `JARVIS_Jev_Workflow.pdf` (7pp, final Eternal run: HOLD 37%, conf 0.20,
+interval SELL–ACCUMULATE, DCF ₹91 vs comps ₹448), `JARVIS_Jev_Flow.mp4` (8s animated
+infographic, 1080x1350, H.264) + `_still.png`, `JARVIS_Jev_LinkedIn_post.txt` (voice-passed).
+Blocked: no Chrome instance connected (extension signed out in Tejas(bia)). Once he connects:
+list_connected_browsers → select_browser → LinkedIn "Start a post" → attach the PDF as a
+document (LinkedIn takes ONE media type per post; the MP4 is a second post) → paste text →
+he confirms the final Post click. Committed: f0de40e on the JARVIS repo.
+
 ## Second pass (2026-09-24) — target ≥9/10, DONE in code
 - `valuation_triangulation` (`report_engine.triangulation_for`): DCF, peer comps, SOTP,
   probability-weighted scenarios, Claude's target, street mean+range, each with gap to price,
