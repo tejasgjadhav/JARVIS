@@ -1,7 +1,7 @@
 """Landscape (16:9, 1920x1080) animated explainer for the Jev integration.
 
 Four scenes with crossfades:
-  1. Hook on a dark ground: the problem, then "So I hired a judge."
+  1. Title slide: how Jev can be used in equity analysis, four uses.
   2. The pipeline as a serpentine of eight cards that enter one by one,
      a gold dot running the track between them.
   3. The verdict: Claude's HOLD struck through, the two Jev scores, the
@@ -9,7 +9,7 @@ Four scenes with crossfades:
   4. Closing card: the takeaway, byline, disclaimer.
 Prices and targets withheld (covered-person rule). Disclaimer on every scene.
 
-Usage: python3 tools/jev_flow_video_wide.py ~/Downloads/Equity_Analyst_Agent_Jev_Flow_16x9.mp4
+Usage: python3 tools/jev_flow_video_wide.py ~/Downloads/Equity_Analyst_Agent_Jev_Explainer_16x9.mp4
 """
 import math
 import subprocess
@@ -50,7 +50,7 @@ STEPS = [
 PROBS = [("SELL", 0.37), ("REDUCE", 0.63), ("HOLD", 0.00), ("ACCUMULATE", 0.00), ("BUY", 0.00)]
 
 # ── timeline ──
-S1 = 0.0; S1_END = 4.2
+S1 = 0.0; S1_END = 5.6
 S2 = S1_END; STEP0 = S2 + 1.0; STEP_DT = 0.75; ENTER = 0.4; S2_END = STEP0 + 8 * STEP_DT + 0.6
 S3 = S2_END; S3_END = S3 + 6.0
 S4 = S3_END; T_END = S4 + 4.0
@@ -83,25 +83,40 @@ def footer(d, dark=False):
     d.text((W - 60 - 400, H - 30), "Jev is a TypeSafe System One model", font=F_F, fill=c)
 
 
-# ── scene 1: hook ──
+# ── scene 1: how Jev can be used in equity analysis ──
+USES = [
+    ("The final gate on a call", "Reads the numbers and the note, returns a probability for each call"),
+    ("A consistency check", "Does the thesis match the figures? Do the figures justify the call?"),
+    ("A reranker for screening", "Score hundreds of names on the same questions, deep-dive the top few"),
+    ("A calibrated score to audit", "Log every decision and check it against what prices did"),
+]
+
+
 def scene1(t):
     img = Image.new("RGBA", (W, H), DARK + (255,)); d = ImageDraw.Draw(img)
-    # soft radial glow
     g = layer(); gd = ImageDraw.Draw(g)
     for r in range(600, 0, -40):
         gd.ellipse((W // 2 - r, 540 - r, W // 2 + r, 540 + r), fill=DARK2 + (int(18 * (1 - r / 600)),))
     img.alpha_composite(g)
-    l1 = "My equity research bot let one model write the story"
-    l2 = "and grade its own homework."
-    k1 = ease_out(t / 1.1); k2 = ease_out((t - 1.0) / 0.9)
-    d.text((160, 380), l1[: int(len(l1) * k1)], font=F_HOOK, fill=WHITE)
-    if k2 > 0: d.text((160, 470), l2[: int(len(l2) * k2)], font=F_HOOK, fill=WHITE)
-    a3 = ease_out((t - 2.4) / 0.6)
-    if a3 > 0:
+    title = "How Jev can be used in Equity Analysis"
+    k1 = ease_out(t / 1.0)
+    d.text((160, 150), title[: int(len(title) * k1)], font=F_HOOK, fill=WHITE)
+    a0 = ease_out((t - 0.9) / 0.4)
+    if a0 > 0:
         l = layer(); ld = ImageDraw.Draw(l)
-        ld.text((160, 620), "So I hired a judge. Its name is Jev.", font=F_HOOK2, fill=GOLD + (255,))
-        ld.rectangle((160, 700, 160 + int(560 * a3), 704), fill=CLAY + (255,))
-        img.alpha_composite(fade(l, a3))
+        ld.text((160, 240), "Jev is TypeSafe's System One model. It does not write. It reads evidence and returns probabilities.",
+                font=F_HOOK2, fill=GOLD + (255,))
+        img.alpha_composite(fade(l, a0))
+    for i, (head, body) in enumerate(USES):
+        a = ease_out((t - 1.5 - i * 0.55) / 0.4)
+        if a <= 0: continue
+        y = 360 + i * 120 + int((1 - a) * 20)
+        l = layer(); ld = ImageDraw.Draw(l)
+        ld.ellipse((160, y + 6, 204, y + 50), fill=CLAY + (255,))
+        ld.text((173, y + 12), str(i + 1), font=F_CB, fill=WHITE + (255,))
+        ld.text((230, y), head, font=F_M, fill=WHITE + (255,))
+        ld.text((230, y + 48), body, font=F_D, fill=(200, 210, 225, 255))
+        img.alpha_composite(fade(l, a))
     footer(d, dark=True)
     return img
 

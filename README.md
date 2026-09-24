@@ -50,6 +50,23 @@ Or use the desktop launcher (`launcher.py`) / `./start.sh`.
 | `WHISPER_MODEL` | STT model (default `small.en`) |
 | `VALIDATE_FORMULAS` | `1` to also execute Excel formulas in validation (slower) |
 
+## Jev: the final call (added Sep 2026)
+
+[Jev](https://docs.typesafe.ai) is TypeSafe's System One model. It does not write; it reads
+evidence and returns calibrated probabilities. JARVIS uses it as the final gate on every call.
+
+1. Claude writes the note, proposes DCF assumptions and weights each valuation method.
+2. Code reconciles DCF, peer comps, SOTP, scenarios and the street into one weighted fair value.
+3. Jev scores the business (0-3, price ignored) and the price (0-3), scores downside risk, and
+   checks Claude's note three ways. Code multiplies the two scores into a probability for each
+   of SELL / REDUCE / HOLD / ACCUMULATE / BUY, with a confidence and an 80% credible interval.
+4. Claude revises only when Jev's call differs from its own or a check fails; Jev judges again.
+5. Every decision is logged (`data/jev_decisions.jsonl`); `tools/jev_calibration.py` scores the
+   log against later prices.
+
+Set `TYPESAFE_API_KEY` in `.env`. Code: `jev_judge.py`, `_jev_loop()` in `server.py`,
+`triangulation_for()` / `reconcile_value()` in `report_engine.py`.
+
 ---
 
 *Automated research tooling — not investment advice. All figures require
