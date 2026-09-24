@@ -1,6 +1,12 @@
 # Handoff — JARVIS × Jev final-decision integration
 _Updated: 2026-09-24 (later) by Claude Code (Fable 5.1)_
 
+## Compliance pass (2026-09-24) — he is a covered person at TIAA
+Public assets now: Eternal named (his call), ALL rupee amounts/prices/targets withheld, technicals
+line dropped, disclaimer on PDF page 1 + last page, in the video footer and at the end of the post.
+Private report PDFs say "personal research tool, not for distribution". Memory:
+`covered-person-compliance`. Public build input: `eternal4_noprice.json` in the session scratchpad.
+
 ## Third pass (2026-09-24) — items 1–3 of the 9.5 plan, DONE in code
 1. Method reconciliation: Claude returns `method_weights` + `method_weights_reason` (build_prompt);
    `reconcile_value()` computes the weighted fair value; Jev answers `weighting_justified` (Noul).

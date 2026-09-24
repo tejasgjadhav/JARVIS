@@ -16,6 +16,13 @@ CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 src = Path(sys.argv[1])
 out = Path(sys.argv[2]).expanduser()
 AGENT = sys.argv[3] if len(sys.argv) > 3 else "JARVIS"   # public name of the agent in the document
+DISCLAIMER = ("Disclaimer. This document describes a personal software project and shows illustrative output of a "
+              "research tool. It is for education only. It is not investment advice, not a recommendation, not an "
+              "offer or solicitation, and not research within the meaning of any regulation. The example names a listed "
+              "company for illustration only; no price, target or holding is disclosed and nothing here reflects any "
+              "position held or intended trade. The author is an employee of a financial services firm; the views are his own, his "
+              "employer has not reviewed or endorsed this document, and it is unrelated to his employment. Model "
+              "outputs can be wrong. Do not act on this document.")
 r = json.loads(src.read_text())
 j = r.get("jev") or {}
 trail = r.get("jev_trail") or []
@@ -61,8 +68,12 @@ bars = "".join(
 lo, hi = (j.get("interval") or ["?", "?"])
 interval_txt = f"{lo} to {hi}" if lo != hi else f"{lo} alone"
 
-tri = j.get("triangulation") or []
+tri = [m for m in (j.get("triangulation") or []) if m.get("value_inr")]
 tri_table = ""
+if not tri and j.get("triangulation"):
+    tri_table = ('<p><b>Every valuation method, side by side (amounts withheld)</b></p><table><tr><th>Method</th><th>Gap to price</th></tr>'
+                 + "".join(f"<tr><td>{E(m['method'])}</td><td>{m['upside_pct']:+.0f}%</td></tr>" for m in j["triangulation"])
+                 + "</table>")
 if tri:
     tri_table = ('<p><b>Every valuation method, side by side</b></p><table><tr><th>Method</th><th>Fair value (Rs)</th><th>Gap to price</th></tr>'
                  + "".join(f"<tr><td>{E(m['method'])}</td><td>{m['value_inr']:,.0f}</td><td>{m['upside_pct']:+.0f}%</td></tr>" for m in tri)
@@ -121,6 +132,7 @@ doc = f'''<!doctype html><html><head><meta charset="utf-8">
 <h1>How Jev helps in equity analysis</h1>
 <div class="sub">The {E(AGENT)} decides buy, accumulate, hold, reduce or sell. Claude writes, Jev judges. · {date.today().strftime("%d %B %Y")}</div>
 {pipeline}
+<div class="note" style="margin-top:10px">{E(DISCLAIMER)}</div>
 </div>
 
 <div class="page">
@@ -154,7 +166,7 @@ doc = f'''<!doctype html><html><head><meta charset="utf-8">
 
 <div class="page">
 <h2>Worked example: {E(r.get("name", "?"))} ({E(r.get("symbol", "?"))})</h2>
-<div class="sub">A real run on {date.today().strftime("%d %B %Y")}, at a market price of Rs {price:,.0f}.</div>
+<div class="sub">A real run on {date.today().strftime("%d %B %Y")}{(", at a market price of Rs " + format(price, ",.0f")) if price else ". Prices and targets withheld."}</div>
 <div class="kpi">
  <div>Final call<b>{E(r.get("verdict", "?"))}</b></div>
  <div>Jev confidence<b>{j.get("confidence", 0):.2f} ({E(j.get("conviction", "?"))})</b></div>
@@ -179,6 +191,7 @@ doc = f'''<!doctype html><html><head><meta charset="utf-8">
 <div>
 <h2>The same example, step by step</h2>
 {steps_html}
+<div class="note" style="margin-top:12px">{E(DISCLAIMER)}</div>
 </div>
 </body></html>'''
 
