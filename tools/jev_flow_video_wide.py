@@ -210,7 +210,11 @@ def scene2(t):
 def scene3(t):
     img = Image.new("RGBA", (W, H), CREAM + (255,)); d = ImageDraw.Draw(img)
     u = t - S3
-    d.text((140, 80), f"Illustrative run: {CASE['company']}. Prices and targets withheld.", font=F_T, fill=NAVY)
+    _title = f"Illustrative run: {CASE['company']}. Prices and targets withheld."
+    _ft = F_T
+    while d.textlength(_title, font=_ft) > W - 280 and _ft.size > 30:
+        _ft = font(_ft.size - 2, True)
+    d.text((140, 80), _title, font=_ft, fill=NAVY)
     # left column: Claude's call, struck through
     a1 = ease_out(u / 0.5)
     l = layer(); ld = ImageDraw.Draw(l)
