@@ -9,7 +9,7 @@ Four scenes with crossfades:
   4. Closing card: the takeaway, byline, disclaimer.
 Prices and targets withheld (covered-person rule). Disclaimer on every scene.
 
-Usage: python3 tools/jev_flow_video_wide.py OUT.mp4 [pace, default 1.6] [core]
+Usage: python3 tools/jev_flow_video_wide.py OUT.mp4 [pace, default 1.6] [core|full] [run.json]
   core = flow + results only, no opening or closing slide
 """
 import math
@@ -49,6 +49,26 @@ STEPS = [
     ("You get the decision", "Chat, voice, Excel, PDF, and a logged trail for calibration", CLAY),
 ]
 PROBS = [("SELL", 0.37), ("REDUCE", 0.63), ("HOLD", 0.00), ("ACCUMULATE", 0.00), ("BUY", 0.00)]
+CASE = {"company": "Eternal", "claude_first": "HOLD", "final": "REDUCE", "conf": 0.53, "lo": "SELL", "hi": "REDUCE",
+        "q": 0.7, "pr": 0.0, "tc": 26, "wj": None, "rc_pct": -24, "revised": True}
+if len(sys.argv) > 4:
+    import json
+    _r = json.load(open(sys.argv[4])); _j = _r["jev"]; _ag = _j.get("agreement") or {}
+    _first = None
+    for st in _r.get("jev_trail", []):
+        if st["title"].startswith("Claude wrote"):
+            _first = st["lines"][0].split(":", 1)[1].strip().split(" ")[0].strip(" .—-")
+    CASE = {"company": _r["name"].replace(" Limited", ""), "claude_first": _first or _ag.get("claude") or "?",
+            "final": _j["verdict"], "conf": _j["confidence"], "lo": _j["interval"][0], "hi": _j["interval"][1],
+            "q": _j["business_quality"]["score"], "pr": _j["valuation"]["score"],
+            "tc": round((_j.get("thesis_consistent") or 0) * 100),
+            "wj": (round(_j["weighting_justified"] * 100) if _j.get("weighting_justified") is not None else None),
+            "rc_pct": round((_j.get("reconciled") or {}).get("upside_pct") or 0),
+            "revised": (_first or "") != _j["verdict"]}
+    PROBS = [(k, _j["probabilities"][k]) for k in ("SELL", "REDUCE", "HOLD", "ACCUMULATE", "BUY")]
+    STEPS[0] = ("You ask", f'"Should I buy {CASE["company"]}?"', CLAY)
+QLAB = ["poor", "average", "good", "excellent"]; PLAB = ["expensive", "fully valued", "modestly cheap", "undervalued"]
+def _lab(v, labs): return labs[min(3, int(round(v)))]
 
 # ── timeline ──
 CORE = len(sys.argv) > 3 and sys.argv[3] == "core"   # flow + results only (no opening or closing slide)
@@ -190,35 +210,35 @@ def scene2(t):
 def scene3(t):
     img = Image.new("RGBA", (W, H), CREAM + (255,)); d = ImageDraw.Draw(img)
     u = t - S3
-    d.text((140, 80), "Illustrative run: Eternal. Prices and targets withheld.", font=F_T, fill=NAVY)
+    d.text((140, 80), f"Illustrative run: {CASE['company']}. Prices and targets withheld.", font=F_T, fill=NAVY)
     # left column: Claude's call, struck through
     a1 = ease_out(u / 0.5)
     l = layer(); ld = ImageDraw.Draw(l)
     ld.text((140, 220), "Claude's call", font=F_S, fill=GREY + (255,))
-    ld.text((140, 262), "HOLD", font=F_BIG, fill=CLAY + (255,))
+    ld.text((140, 262), CASE["claude_first"], font=F_BIG, fill=CLAY + (255,))
     img.alpha_composite(fade(l, a1))
     s = ease_out((u - 0.9) / 0.5)
-    if s > 0:
-        d.line((140, 318, 140 + int(320 * s), 318), fill=NAVY, width=10)
+    if s > 0 and CASE["revised"]:
+        d.line((140, 318, 140 + int((64 * len(CASE["claude_first"]) + 16) * s), 318), fill=NAVY, width=10)
     a2 = ease_out((u - 1.4) / 0.5)
     if a2 > 0:
         l = layer(); ld = ImageDraw.Draw(l)
-        ld.text((140, 420), "Thesis consistent with the figures: 26%", font=F_D, fill=NAVY + (255,))
-        ld.text((140, 456), "So the feedback round fired.", font=F_D, fill=NAVY + (255,))
+        ld.text((140, 420), f"Thesis consistent with the figures: {CASE['tc']}%", font=F_D, fill=NAVY + (255,))
+        ld.text((140, 456), (f"Method weights justified: {CASE['wj']}%. " if CASE["wj"] is not None else "") + ("So the feedback round fired." if CASE["revised"] else "Jev agreed, so round 1 stood."), font=F_D, fill=NAVY + (255,))
         img.alpha_composite(fade(l, a2))
     # middle: the two Jev scores
     a3 = ease_out((u - 2.0) / 0.5)
     if a3 > 0:
         l = layer(); ld = ImageDraw.Draw(l)
         ld.text((720, 220), "Jev's two judgments", font=F_S, fill=GREY + (255,))
-        for k, (lab, val, mx, word) in enumerate([("Business quality", 0.7, 3, "average"), ("Price attractiveness", 0.0, 3, "expensive")]):
+        for k, (lab, val, mx, word) in enumerate([("Business quality", CASE["q"], 3, _lab(CASE["q"], QLAB)), ("Price attractiveness", CASE["pr"], 3, _lab(CASE["pr"], PLAB))]):
             y = 275 + k * 110
             ld.text((720, y), lab, font=F_CB, fill=NAVY + (255,))
             ld.rounded_rectangle((720, y + 40, 720 + 420, y + 62), radius=11, fill=LIGHT + (255,))
             g = ease_out((u - 2.2 - k * 0.3) / 0.8)
             ld.rounded_rectangle((720, y + 40, 720 + max(22, int(420 * (val / mx) * g)), y + 62), radius=11, fill=BLUE + (255,))
             ld.text((720 + 435, y + 36), f"{val * g:.1f} / {mx}  {word}", font=F_CD, fill=NAVY + (255,))
-        ld.text((720, 500), "average business  x  expensive price  =", font=F_D, fill=NAVY + (255,))
+        ld.text((720, 500), f"{_lab(CASE['q'], QLAB)} business  x  {_lab(CASE['pr'], PLAB)} price  =", font=F_D, fill=NAVY + (255,))
         img.alpha_composite(fade(l, a3))
     # right: composed verdict stamp + bars
     a4 = ease_out((u - 3.2) / 0.5)
@@ -227,23 +247,24 @@ def scene3(t):
         pulse = 0.5 + 0.5 * math.sin((u - 3.2) * 2 * math.pi / 1.2)
         col = tuple(int(CLAY[c] + (GOLD[c] - CLAY[c]) * pulse * 0.5) for c in range(3))
         ld.rounded_rectangle((1330, 240, 1810, 380), radius=20, outline=col + (255,), width=6)
-        ld.text((1362, 258), "REDUCE", font=F_BIG, fill=CLAY + (255,))
-        ld.text((1360, 410), "63% probability  ·  confidence 0.53", font=F_D, fill=NAVY + (255,))
-        ld.text((1360, 444), "80% interval SELL to REDUCE", font=F_D, fill=GREY + (255,))
+        ld.text((1362, 258), CASE["final"], font=F_BIG, fill=CLAY + (255,))
+        ld.text((1360, 410), f"{dict(PROBS)[CASE['final']]*100:.0f}% probability  ·  confidence {CASE['conf']:.2f}", font=F_D, fill=NAVY + (255,))
+        ld.text((1360, 444), (f"80% interval {CASE['lo']} to {CASE['hi']}" if CASE["lo"] != CASE["hi"] else f"80% interval {CASE['lo']} alone"), font=F_D, fill=GREY + (255,))
         by = 520
         for lab, p in PROBS:
             g = ease_out((u - 3.4) / 1.0)
             ld.text((1330, by - 2), lab, font=F_CD, fill=NAVY + (255,))
             wpx = int(300 * p * g)
-            ld.rectangle((1470, by, 1470 + max(wpx, 2), by + 16), fill=((CLAY if lab == "REDUCE" else BLUE) + (255,)))
+            ld.rectangle((1470, by, 1470 + max(wpx, 2), by + 16), fill=((CLAY if lab == CASE["final"] else BLUE) + (255,)))
             ld.text((1470 + wpx + 8, by - 2), f"{p * 100 * g:.0f}%", font=F_CD, fill=NAVY + (255,))
             by += 28
         img.alpha_composite(fade(l, a4))
     a5 = ease_out((u - 4.3) / 0.5)
     if a5 > 0:
         l = layer(); ld = ImageDraw.Draw(l)
-        ld.text((140, 760), "Claude read the feedback and moved to REDUCE. Jev judged again and confirmed it.", font=F_M, fill=NAVY + (255,))
-        ld.text((140, 810), "Reconciled fair value 24% below the price on Claude's own method weights.", font=F_D, fill=GREY + (255,))
+        ld.text((140, 760), (f"Claude read the feedback and moved to {CASE['final']}. Jev judged again and confirmed it." if CASE["revised"]
+                             else f"Claude and Jev agreed on {CASE['final']} in round 1."), font=F_M, fill=NAVY + (255,))
+        ld.text((140, 810), f"Reconciled fair value {abs(CASE['rc_pct'])}% {'below' if CASE['rc_pct'] < 0 else 'above'} the price on Claude's own method weights.", font=F_D, fill=GREY + (255,))
         img.alpha_composite(fade(l, a5))
     footer(d)
     return img
