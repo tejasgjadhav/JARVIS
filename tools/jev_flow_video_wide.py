@@ -219,11 +219,17 @@ def scene3(t):
     a1 = ease_out(u / 0.5)
     l = layer(); ld = ImageDraw.Draw(l)
     ld.text((140, 220), "Claude's call", font=F_S, fill=GREY + (255,))
-    ld.text((140, 262), CASE["claude_first"], font=F_BIG, fill=CLAY + (255,))
+    _fb = F_BIG
+    while ld.textlength(CASE["claude_first"], font=_fb) > 540 and _fb.size > 40:
+        _fb = font(_fb.size - 4, True)
+    ld.text((140, 262 + (F_BIG.size - _fb.size) // 2), CASE["claude_first"], font=_fb, fill=CLAY + (255,))
     img.alpha_composite(fade(l, a1))
     s = ease_out((u - 0.9) / 0.5)
     if s > 0 and CASE["revised"]:
-        d.line((140, 318, 140 + int((64 * len(CASE["claude_first"]) + 16) * s), 318), fill=NAVY, width=10)
+        _fb2 = F_BIG
+        while d.textlength(CASE["claude_first"], font=_fb2) > 540 and _fb2.size > 40:
+            _fb2 = font(_fb2.size - 4, True)
+        d.line((140, 318, 140 + int((d.textlength(CASE["claude_first"], font=_fb2) + 16) * s), 318), fill=NAVY, width=10)
     a2 = ease_out((u - 1.4) / 0.5)
     if a2 > 0:
         l = layer(); ld = ImageDraw.Draw(l)
