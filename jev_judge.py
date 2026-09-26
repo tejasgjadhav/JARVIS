@@ -310,7 +310,8 @@ def describe_state(state: dict) -> list:
     if dq:
         out.append(f"Data quality: financials {dq.get('financials_status')} (as of {dq.get('financials_asof')}); "
                    f"price cross-check {'passed' if dq.get('price_check_ok') else 'FAILED'}"
-                   + (f" ({dq['price_check_detail']})" if dq.get("price_check_detail") else "") + ".")
+                   + (f" ({dq['price_check_detail']})" if dq.get("price_check_detail") else "") + "."
+                   + (f" {dq['manual_overrides']}." if dq.get("manual_overrides") else ""))
     if state.get("technicals"):
         tech = state["technicals"]
         out.append("The technicals: " + ", ".join(f"{k} {v}" for k, v in list(tech.items())[:8]) + ".")

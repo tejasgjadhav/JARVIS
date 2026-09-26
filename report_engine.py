@@ -131,7 +131,32 @@ def _num(v):
         return None
 
 
-def fetch_stock(symbol: str) -> dict:
+def fetch_stock(symbol: str, overrides=None) -> dict:
+    d = _fetch_stock(symbol)
+    return apply_overrides(d, overrides) if overrides else d
+
+
+def apply_overrides(d: dict, overrides: dict) -> dict:
+    """Manual, disclosed fills for fields the feed lacks (new listings: share
+    count, name, sector). Derived figures (market cap, P/E) are computed from
+    the overrides, never typed in. The note travels to Jev and into the trail."""
+    applied = []
+    for k, v in (overrides or {}).items():
+        if v is None:
+            continue
+        d[k] = v
+        applied.append(k)
+    if d.get("shares") and d.get("price") and not d.get("market_cap"):
+        d["market_cap"] = d["shares"] * d["price"]; applied.append("market_cap (= shares x price)")
+    if d.get("market_cap") and d.get("net_income") and not d.get("pe") and d["net_income"] > 0:
+        d["pe"] = d["market_cap"] / d["net_income"]; applied.append("pe (= market cap / net income)")
+    if d.get("market_cap") and d.get("revenue") and d.get("margin") is None and d.get("net_income"):
+        d["margin"] = d["net_income"] / d["revenue"]; applied.append("margin")
+    d["overrides_note"] = "Manual overrides applied: " + ", ".join(applied) if applied else None
+    return d
+
+
+def _fetch_stock(symbol: str) -> dict:
     sym = normalize_symbol(symbol)
     t = yf.Ticker(sym)
     info = {}
@@ -1886,9 +1911,9 @@ def validate_excel(xlsx_bytes: bytes, assumptions: dict) -> dict:
 # ═══════════════════════════════════════════════════════════
 #  5. TOP-LEVEL
 # ═══════════════════════════════════════════════════════════
-def prepare(symbol: str):
+def prepare(symbol: str, overrides=None):
     """Fetch + analyse. Returns (data, analysis)."""
-    d = fetch_stock(symbol)
+    d = fetch_stock(symbol, overrides)
     a = analyze(d)
     return d, a
 
@@ -2416,7 +2441,8 @@ def data_quality_for(d: dict):
     checks = _price_validation_checks(d)
     return {"financials_asof": rec["asof"], "financials_status": rec["status"], "financials_ok": rec["ok"],
             "price_check_ok": all(c["pass"] for c in checks),
-            "price_check_detail": "; ".join(c["detail"] for c in checks)}
+            "price_check_detail": "; ".join(c["detail"] for c in checks),
+            "manual_overrides": d.get("overrides_note")}
 
 
 def build_revision_prompt(d: dict, a: dict, narrative: dict, jev: dict, horizon="long"):

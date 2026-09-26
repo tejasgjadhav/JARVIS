@@ -437,7 +437,7 @@ def stock_report():
     if not symbol:
         return jsonify({'error': 'Provide a stock symbol, e.g. INFY'}), 400
     try:
-        d, a = R.prepare(symbol)
+        d, a = R.prepare(symbol, data.get('overrides'))   # disclosed fills for fields the feed lacks
     except Exception as ex:
         return jsonify({'error': str(ex)}), 502
     narrative = _claude_narrative(d, a)          # hybrid: Claude authors, real data grounds
